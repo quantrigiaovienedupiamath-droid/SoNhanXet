@@ -59,7 +59,7 @@ const LOGO_URL = "./logo.jpg";
 // ── Vercel API wrapper ─────────────────────────────────
 const API_URL = "https://script.google.com/macros/s/AKfycbyskG1qtQYcEYHrpjzWoLVyykxU7Bxga7OGDGMA0MO8V1pbGyI1MLPX2DbQuGxWnnVk/exec";
 
-const CACHEABLE_METHODS = ['getMonthlyStudents', 'loadDashboardData', 'getStudentsInWeek', 'getDeadlinesForTeacher', 'getStudentHistory'];
+const CACHEABLE_METHODS = [];
 
 function callApi(method, ...args) {
   const cacheKey = method + '_' + JSON.stringify(args);
