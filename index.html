@@ -56,44 +56,80 @@
 const { useState, useEffect, useMemo } = React;
 const LOGO_URL = "./logo.jpg";
 
-// ── Vercel API wrapper ─────────────────────────────────
-const API_URL = "https://script.google.com/macros/s/AKfycbyskG1qtQYcEYHrpjzWoLVyykxU7Bxga7OGDGMA0MO8V1pbGyI1MLPX2DbQuGxWnnVk/exec";
+// ── Smart Cache ─────────────────────────────────────────────
+// Cache các API chỉ đọc (ít thay đổi), tự hết hạn sau 5 phút
+// Sau khi GV lưu nhận xét → xóa cache liên quan ngay lập tức
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 phút
 
-const CACHEABLE_METHODS = [];
+// Các method được cache (chỉ đọc, ít thay đổi)
+const CACHEABLE_METHODS = [
+  'loadDashboardData',    // danh sách tuần + tổng quan → cache 5 phút
+  'getWeeks',             // danh sách tab tuần
+  'getDeadlinesForTeacher',
+  'getStudentHistory',    // lịch sử HS
+];
+
+// Các method KHÔNG cache vì cần data mới nhất
+// authenticate, getStudentsInWeek, getMonthlyStudents, saveFeedback, saveMonthlyReport
+
+function cacheSet(key, data) {
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ data, ts: Date.now() }));
+  } catch(e) {}
+}
+
+function cacheGet(key) {
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (Date.now() - parsed.ts > CACHE_TTL_MS) {
+      sessionStorage.removeItem(key);
+      return null;
+    }
+    return parsed.data;
+  } catch(e) { return null; }
+}
+
+function cacheClear(pattern) {
+  try {
+    const keys = Object.keys(sessionStorage);
+    keys.forEach(k => { if (k.includes(pattern)) sessionStorage.removeItem(k); });
+  } catch(e) {}
+}
 
 function callApi(method, ...args) {
-  const cacheKey = method + '_' + JSON.stringify(args);
+  const cacheKey = 'api_' + method + '_' + JSON.stringify(args);
   if (CACHEABLE_METHODS.includes(method)) {
-    const cached = sessionStorage.getItem(cacheKey);
-    if (cached) return Promise.resolve(JSON.parse(cached));
+    const cached = cacheGet(cacheKey);
+    if (cached) return Promise.resolve(cached);
   }
   return fetch(API_URL, {
     method: 'POST',
-    // Dùng text/plain để tránh CORS preflight request
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
     body: JSON.stringify({ action: method, args: args }),
     redirect: 'follow',
   })
   .then(res => {
-    if (!res.ok) {
-      throw new Error('Lỗi kết nối server: HTTP ' + res.status);
-    }
+    if (!res.ok) throw new Error('Lỗi kết nối server: HTTP ' + res.status);
     return res.text();
   })
   .then(text => {
-    if (!text || text.trim() === '') {
-      throw new Error('Server không trả về dữ liệu. Kiểm tra lại URL Web App.');
-    }
+    if (!text || text.trim() === '') throw new Error('Server không trả về dữ liệu.');
     let data;
-    try {
-      data = JSON.parse(text);
-    } catch(e) {
-      throw new Error('Lỗi định dạng dữ liệu: ' + text.substring(0, 100));
-    }
+    try { data = JSON.parse(text); }
+    catch(e) { throw new Error('Lỗi định dạng dữ liệu: ' + text.substring(0, 100)); }
     if (data.error) throw new Error(data.error);
     const finalResult = data.result !== undefined ? data.result : data;
+    // Lưu cache nếu là method được phép cache
     if (CACHEABLE_METHODS.includes(method)) {
-      sessionStorage.setItem(cacheKey, JSON.stringify(finalResult));
+      cacheSet(cacheKey, finalResult);
+    }
+    // Sau khi lưu nhận xét → xóa cache getStudentsInWeek và getMonthlyStudents
+    if (method === 'saveFeedback' || method === 'saveMonthlyReport') {
+      cacheClear('api_getStudentsInWeek');
+      cacheClear('api_getMonthlyStudents');
+      cacheClear('api_getStudentHistory');
     }
     return finalResult;
   });
