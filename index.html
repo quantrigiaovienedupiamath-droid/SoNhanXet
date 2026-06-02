@@ -136,6 +136,7 @@ function formatCountdown(msLeft) {
 function LoginScreen({ onLogin }) {
   const [login, setLogin] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -168,8 +169,17 @@ function LoginScreen({ onLogin }) {
           </div>
           <div>
             <label className="block text-xs font-mono uppercase tracking-wider text-[var(--muted)] mb-2">Mật khẩu</label>
-            <input type="password" className="field w-full"
-              value={password} onChange={e => setPassword(e.target.value)} required />
+            <div className="relative">
+              <input type={showPassword ? "text" : "password"} className="field w-full pr-14"
+                value={password} onChange={e => setPassword(e.target.value)} required />
+              <button 
+                type="button" 
+                onClick={() => setShowPassword(!showPassword)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-mono font-medium text-[var(--muted)] hover:text-[var(--ink)] transition-colors"
+              >
+                {showPassword ? "ẨN" : "HIỆN"}
+              </button>
+            </div>
           </div>
           {error && <div className="text-sm text-[var(--bad)] bg-[var(--bad)]/5 border border-[var(--bad)]/20 rounded-md px-3 py-2">{error}</div>}
           <button type="submit" disabled={loading} className="ink-btn w-full py-3 rounded-md font-medium">
