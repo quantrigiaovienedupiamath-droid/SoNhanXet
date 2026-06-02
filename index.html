@@ -104,13 +104,20 @@ function callApi(method, ...args) {
     const cached = cacheGet(cacheKey);
     if (cached) return Promise.resolve(cached);
   }
+
+  // Timeout 40 giây - tránh treo vô hạn
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 40000);
+
   return fetch(API_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
     body: JSON.stringify({ action: method, args: args }),
     redirect: 'follow',
+    signal: controller.signal,
   })
   .then(res => {
+    clearTimeout(timeoutId);
     if (!res.ok) throw new Error('Lỗi kết nối server: HTTP ' + res.status);
     return res.text();
   })
@@ -121,17 +128,20 @@ function callApi(method, ...args) {
     catch(e) { throw new Error('Lỗi định dạng dữ liệu: ' + text.substring(0, 100)); }
     if (data.error) throw new Error(data.error);
     const finalResult = data.result !== undefined ? data.result : data;
-    // Lưu cache nếu là method được phép cache
     if (CACHEABLE_METHODS.includes(method)) {
       cacheSet(cacheKey, finalResult);
     }
-    // Sau khi lưu nhận xét → xóa cache getStudentsInWeek và getMonthlyStudents
     if (method === 'saveFeedback' || method === 'saveMonthlyReport') {
       cacheClear('api_getStudentsInWeek');
       cacheClear('api_getMonthlyStudents');
       cacheClear('api_getStudentHistory');
     }
     return finalResult;
+  })
+  .catch(e => {
+    clearTimeout(timeoutId);
+    if (e.name === 'AbortError') throw new Error('Kết nối quá chậm (>40s). Vui lòng thử lại.');
+    throw e;
   });
 }
 
