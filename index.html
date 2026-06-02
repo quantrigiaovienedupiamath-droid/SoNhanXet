@@ -59,7 +59,14 @@ const LOGO_URL = "./logo.jpg";
 // ── Vercel API wrapper ─────────────────────────────────
 const API_URL = "https://script.google.com/macros/s/AKfycbyskG1qtQYcEYHrpjzWoLVyykxU7Bxga7OGDGMA0MO8V1pbGyI1MLPX2DbQuGxWnnVk/exec";
 
+const CACHEABLE_METHODS = ['getMonthlyStudents', 'loadDashboardData', 'getStudentsInWeek', 'getDeadlinesForTeacher', 'getStudentHistory'];
+
 function callApi(method, ...args) {
+  const cacheKey = method + '_' + JSON.stringify(args);
+  if (CACHEABLE_METHODS.includes(method)) {
+    const cached = sessionStorage.getItem(cacheKey);
+    if (cached) return Promise.resolve(JSON.parse(cached));
+  }
   return fetch(API_URL, {
     method: 'POST',
     // Dùng text/plain để tránh CORS preflight request
@@ -84,7 +91,11 @@ function callApi(method, ...args) {
       throw new Error('Lỗi định dạng dữ liệu: ' + text.substring(0, 100));
     }
     if (data.error) throw new Error(data.error);
-    return data.result !== undefined ? data.result : data;
+    const finalResult = data.result !== undefined ? data.result : data;
+    if (CACHEABLE_METHODS.includes(method)) {
+      sessionStorage.setItem(cacheKey, JSON.stringify(finalResult));
+    }
+    return finalResult;
   });
 }
 
