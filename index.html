@@ -365,7 +365,7 @@ function App() {
   }, [students]);
 
   const activeStudents = students.filter(s => !s.is_absent);
-  const totalDone = activeStudents.filter(s => s.feedback_text && s.feedback_text.trim()).length;
+  const totalDone = activeStudents.filter(s => s.feedback_text && String(s.feedback_text).trim()).length;
   const total = activeStudents.length;
 
   const reloadStudents = async () => {
@@ -488,7 +488,7 @@ function App() {
               {classesByCode.map((cls, i) => {
                 const sched = classes.find(c => c.class_code === cls.class_code);
                 const actv = cls.students.filter(s => !s.is_absent);
-                const done = actv.filter(s => s.feedback_text && s.feedback_text.trim()).length;
+                const done = actv.filter(s => s.feedback_text && String(s.feedback_text).trim()).length;
                 const totalClass = actv.length;
                 const deadlineTs = deadlines[cls.class_code];
                 const countdown = deadlineTs ? formatCountdown(deadlineTs - nowTick) : null;
@@ -510,7 +510,7 @@ function App() {
                     </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                       {cls.students.map(s => {
-                        const hasNote = s.feedback_text && s.feedback_text.trim();
+                        const hasNote = s.feedback_text && String(s.feedback_text).trim();
                         const b1 = getScoreChip(s.score_b1);
                         const b2 = getScoreChip(s.score_b2);
                         const cardStyle = s.is_gifted
@@ -700,9 +700,9 @@ function App() {
 // ── Detail panel nhận xét tuần ─────────────────────────────
 function DetailPanel({ student, fileId, tab, currentMonth, currentYear, teacherLogin, onClose, onSaved }) {
   const [view, setView] = useState('write');
-  const [note, setNote] = useState(student.feedback_text || '');
-  const [scoreB1, setScoreB1] = useState(student.score_b1 || '');
-  const [scoreB2, setScoreB2] = useState(student.score_b2 || '');
+  const [note, setNote] = useState(student.feedback_text != null ? String(student.feedback_text) : '');
+  const [scoreB1, setScoreB1] = useState(student.score_b1 != null ? String(student.score_b1) : '');
+  const [scoreB2, setScoreB2] = useState(student.score_b2 != null ? String(student.score_b2) : '');
   const [suggestion, setSuggestion] = useState('');
   const [loadingAi, setLoadingAi] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -900,15 +900,15 @@ ${note}`;
 // ── Monthly detail panel ────────────────────────────────────
 function MonthlyDetailPanel({ student, fileId, currentMonth, currentYear, teacherLogin, onClose, onSaved }) {
   const [fields, setFields] = useState({
-    diem_dat_duoc: student.diem_dat_duoc || '',
-    kt_dat:        student.kt_dat        || '',
-    kt_caithien:   student.kt_caithien   || '',
-    kn_dat:        student.kn_dat        || '',
-    kn_caithien:   student.kn_caithien   || '',
-    td_dat:        student.td_dat        || '',
-    td_caithien:   student.td_caithien   || '',
-    khac_phuc:     student.khac_phuc     || '',
-    giai_phap:     student.giai_phap     || '',
+    diem_dat_duoc: student.diem_dat_duoc != null ? String(student.diem_dat_duoc) : '',
+    kt_dat:        student.kt_dat        != null ? String(student.kt_dat)        : '',
+    kt_caithien:   student.kt_caithien   != null ? String(student.kt_caithien)   : '',
+    kn_dat:        student.kn_dat        != null ? String(student.kn_dat)        : '',
+    kn_caithien:   student.kn_caithien   != null ? String(student.kn_caithien)   : '',
+    td_dat:        student.td_dat        != null ? String(student.td_dat)        : '',
+    td_caithien:   student.td_caithien   != null ? String(student.td_caithien)   : '',
+    khac_phuc:     student.khac_phuc     != null ? String(student.khac_phuc)     : '',
+    giai_phap:     student.giai_phap     != null ? String(student.giai_phap)     : '',
   });
   const [saving, setSaving] = useState(false);
   const [exporting, setExporting] = useState(false);
