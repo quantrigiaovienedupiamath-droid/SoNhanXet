@@ -658,6 +658,7 @@ function App() {
       {/* ── Panel nhận xét tuần */}
       {selected && (
         <DetailPanel
+          key={selected.student_id + '_' + selected.rowIndex}
           student={selected}
           fileId={activeWeekFileId || (fileInfo && fileInfo.id)}  // ← THAY ĐỔI: dùng activeWeekFileId
           tab={activeWeek}
@@ -678,6 +679,7 @@ function App() {
       {/* ── THAY ĐỔI: dùng student.fileId từ mỗi student object thay vì monthlyFile.id chung */}
       {selectedMonthly && (
         <MonthlyDetailPanel
+          key={selectedMonthly.student_id + '_' + selectedMonthly.fileId}
           student={selectedMonthly}
           fileId={selectedMonthly.fileId}          // ← fileId của file tháng tương ứng
           currentMonth={selectedMonthly.month}     // ← month của student đó (T hoặc T-1)
@@ -703,6 +705,7 @@ function DetailPanel({ student, fileId, tab, currentMonth, currentYear, teacherL
   const [note, setNote] = useState(student.feedback_text != null ? String(student.feedback_text) : '');
   const [scoreB1, setScoreB1] = useState(student.score_b1 != null ? String(student.score_b1) : '');
   const [scoreB2, setScoreB2] = useState(student.score_b2 != null ? String(student.score_b2) : '');
+  const [statusEvaluation, setStatusEvaluation] = useState(student.status != null ? String(student.status) : '');
   const [suggestion, setSuggestion] = useState('');
   const [loadingAi, setLoadingAi] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -743,7 +746,7 @@ ${note}`;
   const handleSave = async () => {
     setSaving(true);
     // fileId truyền vào đây đã là activeWeekFileId (đúng file dù tuần thuộc T hay T-1)
-    const result = await callApi('saveFeedback', fileId, tab, student.rowIndex, note, generateParent(), teacherLogin, scoreB1, scoreB2);
+    const result = await callApi('saveFeedback', fileId, tab, student.rowIndex, note, generateParent(), teacherLogin, scoreB1, scoreB2, statusEvaluation);
     setSaving(false);
     if (result.error) alert('Lỗi: ' + result.error);
     else onSaved();
@@ -808,8 +811,16 @@ ${note}`;
 
               <div className="paper-card rounded-md p-4 grid grid-cols-3 gap-4">
                 <div>
-                  <div className="text-xs font-mono text-[var(--muted)] uppercase mb-2">Đánh giá</div>
-                  <div className="font-display text-xl font-semibold">{student.status || '—'}</div>
+                  <label className="text-xs font-mono text-[var(--muted)] uppercase mb-2 block">Đánh giá</label>
+                  <select className="field w-full text-center font-display text-sm font-semibold"
+                    style={{padding:'8px 10px'}}
+                    value={statusEvaluation} onChange={e => setStatusEvaluation(e.target.value)} disabled={student.is_absent}>
+                    <option value="">— Chọn —</option>
+                    <option value="Xuất sắc">Xuất sắc</option>
+                    <option value="Tốt">Tốt</option>
+                    <option value="Đạt">Đạt</option>
+                    <option value="Cần cố gắng">Cần cố gắng</option>
+                  </select>
                 </div>
                 <div>
                   <label className="text-xs font-mono text-[var(--muted)] uppercase mb-2 block">BTVN B1</label>
