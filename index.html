@@ -560,12 +560,47 @@ function App() {
         <>
           <div className="mb-6">
             <p className="text-xs font-mono uppercase tracking-[0.2em] text-[var(--muted)] mb-2">
-              Tháng {currentMonth}/{currentYear} &amp; tháng trước
+              {(() => {
+                const today = new Date();
+                const day = today.getDate();
+                // Trước ngày 10: đang điền báo cáo tháng T-1
+                // Từ ngày 10 trở đi: đang điền báo cáo tháng T
+                if (day < 10) {
+                  const reportMonth = currentMonth === 1 ? 12 : currentMonth - 1;
+                  const reportYear  = currentMonth === 1 ? currentYear - 1 : currentYear;
+                  return `Tháng ${reportMonth}/${reportYear} & tháng trước`;
+                } else {
+                  return `Tháng ${currentMonth}/${currentYear} & tháng trước`;
+                }
+              })()}
             </p>
             <h1 className="font-display text-4xl md:text-5xl font-semibold leading-none">Báo cáo tháng</h1>
             <p className="mt-3 text-[var(--muted)] max-w-2xl">
-              Viết báo cáo tổng kết tháng cho từng HS. Danh sách bao gồm tháng {currentMonth}/{currentYear} và tháng trước.
-              <strong> Deadline tháng này: 23:59 ngày 10/{currentMonth < 12 ? currentMonth + 1 : 1}</strong>.
+              {(() => {
+                const today = new Date();
+                const day = today.getDate();
+                if (day < 10) {
+                  // Trước ngày 10/T: báo cáo tháng T-1, deadline ngày 10/T
+                  const reportMonth = currentMonth === 1 ? 12 : currentMonth - 1;
+                  const reportYear  = currentMonth === 1 ? currentYear - 1 : currentYear;
+                  return (
+                    <>
+                      Viết báo cáo tổng kết tháng cho từng HS. Danh sách bao gồm tháng {reportMonth}/{reportYear} và tháng trước.
+                      <strong> Deadline tháng này: 23:59 ngày 10/{currentMonth}/{currentYear}</strong>.
+                    </>
+                  );
+                } else {
+                  // Từ ngày 10/T: báo cáo tháng T, deadline ngày 10/T+1
+                  const deadlineMonth = currentMonth < 12 ? currentMonth + 1 : 1;
+                  const deadlineYear  = currentMonth < 12 ? currentYear : currentYear + 1;
+                  return (
+                    <>
+                      Viết báo cáo tổng kết tháng cho từng HS. Danh sách bao gồm tháng {currentMonth}/{currentYear} và tháng trước.
+                      <strong> Deadline tháng này: 23:59 ngày 10/{deadlineMonth}/{deadlineYear}</strong>.
+                    </>
+                  );
+                }
+              })()}
             </p>
           </div>
 
