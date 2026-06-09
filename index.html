@@ -794,12 +794,12 @@ ${note}`;
 
   const handleSave = async () => {
     const missingFields = [];
-    if (!statusEvaluation || !statusEvaluation.trim()) missingFields.push("Đánh giá chung");
     if (!student.is_absent) {
+      if (!statusEvaluation || !statusEvaluation.trim()) missingFields.push("Đánh giá chung");
       if (!scoreB1 || !scoreB1.trim()) missingFields.push("Điểm BTVN buổi 1");
       if (!scoreB2 || !scoreB2.trim()) missingFields.push("Điểm BTVN buổi 2");
+      if (!note || !note.trim()) missingFields.push("Nhận xét chung");
     }
-    if (!note || !note.trim()) missingFields.push("Nhận xét chung");
 
     if (missingFields.length > 0) {
       alert("Không thể lưu! Vui lòng điền đầy đủ các trường:\n• " + missingFields.join("\n• "));
