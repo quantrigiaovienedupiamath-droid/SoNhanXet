@@ -328,23 +328,14 @@ function App() {
     if (!activeWeek || !teacher) return;
     if (!initialLoaded) { setInitialLoaded(true); return; }
 
-    // ── THAY ĐỔI: dùng activeWeekFileId thay vì fileInfo.id
     if (!activeWeekFileId) return;
     setLoading(true);
     callApi('getStudentsInWeek', activeWeekFileId, activeWeek, teacher.login).then(data => {
       if (data.error) { setError(data.error); setLoading(false); return; }
-      setStudents(data.students);
+      setStudents(data.students || []);
+      if (data.deadlines) setDeadlines(data.deadlines);
       setLoading(false);
-    });
-    // Tính lại deadlines cho tuần mới
-    const weekObj = weeks.find(w => w.id === activeWeek);
-    if (weekObj) {
-      // Lấy năm từ sortKey (không có trong object, nên tính từ range + fileId)
-      // Đơn giản: dùng currentYear làm fallback, backend calcDeadline có xử lý
-      callApi('getDeadlinesForTeacher', teacher.login, weekObj.range, currentYear).then(d => {
-        if (d.deadlines) setDeadlines(d.deadlines);
-      });
-    }
+    }).catch(e => { setError(e.toString()); setLoading(false); });
   }, [activeWeek, activeWeekFileId]);
 
   // Khi user chọn tuần mới từ dropdown → cập nhật cả activeWeek lẫn activeWeekFileId
@@ -369,10 +360,16 @@ function App() {
   const total = activeStudents.length;
 
   const reloadStudents = async () => {
-    // ── THAY ĐỔI: dùng activeWeekFileId
     if (!activeWeekFileId || !activeWeek) return;
-    const data = await callApi('getStudentsInWeek', activeWeekFileId, activeWeek, teacher.login);
-    if (data.students) setStudents(data.students);
+    setLoading(true);
+    try {
+      const data = await callApi('getStudentsInWeek', activeWeekFileId, activeWeek, teacher.login);
+      if (data.students) setStudents(data.students);
+      if (data.deadlines) setDeadlines(data.deadlines);
+    } catch (e) {
+      alert("Lỗi khi tải lại dữ liệu: " + e.toString());
+    }
+    setLoading(false);
   };
 
   if (!teacher) return <LoginScreen onLogin={setTeacher} />;
@@ -469,11 +466,16 @@ function App() {
           </div>
 
           {/* ── THAY ĐỔI: dropdown tuần dùng handleWeekChange thay vì setActiveWeek trực tiếp */}
-          <div className="mb-6 flex items-center gap-3 flex-wrap">
-            <label className="text-xs font-mono uppercase tracking-wider text-[var(--muted)]">Chọn tuần:</label>
-            <select className="field" value={activeWeek || ''} onChange={e => handleWeekChange(e.target.value)}>
-              {weeks.map(w => <option key={w.id} value={w.id}>{w.label} · {w.range}</option>)}
-            </select>
+          <div className="mb-6 flex items-center justify-between flex-wrap gap-3">
+            <div className="flex items-center gap-3 flex-wrap">
+              <label className="text-xs font-mono uppercase tracking-wider text-[var(--muted)]">Chọn tuần:</label>
+              <select className="field" value={activeWeek || ''} onChange={e => handleWeekChange(e.target.value)}>
+                {weeks.map(w => <option key={w.id} value={w.id}>{w.label} · {w.range}</option>)}
+              </select>
+            </div>
+            <button onClick={reloadStudents} disabled={loading} className="chip chip-muted hover:bg-[var(--ink)] hover:text-[var(--paper)] transition-all font-mono text-xs flex items-center gap-1">
+              🔄 Tải lại dữ liệu
+            </button>
           </div>
 
           {loading ? (
@@ -558,24 +560,30 @@ function App() {
         {/* ── TAB BÁO CÁO THÁNG ─────────────────────────────── */}
         {mainTab === 'month' && (
         <>
-          <div className="mb-6">
-            <p className="text-xs font-mono uppercase tracking-[0.2em] text-[var(--muted)] mb-2">
-              {(() => {
-                const today = new Date();
-                const day = today.getDate();
-                // Trước ngày 10: đang điền báo cáo tháng T-1
-                // Từ ngày 10 trở đi: đang điền báo cáo tháng T
-                if (day < 10) {
-                  const reportMonth = currentMonth === 1 ? 12 : currentMonth - 1;
-                  const reportYear  = currentMonth === 1 ? currentYear - 1 : currentYear;
-                  return `Tháng ${reportMonth}/${reportYear} & tháng trước`;
-                } else {
-                  return `Tháng ${currentMonth}/${currentYear} & tháng trước`;
-                }
-              })()}
-            </p>
-            <h1 className="font-display text-4xl md:text-5xl font-semibold leading-none">Báo cáo tháng</h1>
-            <p className="mt-3 text-[var(--muted)] max-w-2xl">
+          <div className="mb-6 flex justify-between items-end flex-wrap gap-4">
+            <div>
+              <p className="text-xs font-mono uppercase tracking-[0.2em] text-[var(--muted)] mb-2">
+                {(() => {
+                  const today = new Date();
+                  const day = today.getDate();
+                  // Trước ngày 10: đang điền báo cáo tháng T-1
+                  // Từ ngày 10 trở đi: đang điền báo cáo tháng T
+                  if (day < 10) {
+                    const reportMonth = currentMonth === 1 ? 12 : currentMonth - 1;
+                    const reportYear  = currentMonth === 1 ? currentYear - 1 : currentYear;
+                    return `Tháng ${reportMonth}/${reportYear} & tháng trước`;
+                  } else {
+                    return `Tháng ${currentMonth}/${currentYear} & tháng trước`;
+                  }
+                })()}
+              </p>
+              <h1 className="font-display text-4xl md:text-5xl font-semibold leading-none">Báo cáo tháng</h1>
+            </div>
+            <button onClick={reloadMonthly} disabled={loadingMonthly} className="chip chip-muted hover:bg-[var(--ink)] hover:text-[var(--paper)] transition-all font-mono text-xs flex items-center gap-1">
+              🔄 Tải lại dữ liệu
+            </button>
+          </div>
+          <p className="mt-3 text-[var(--muted)] max-w-2xl">
               {(() => {
                 const today = new Date();
                 const day = today.getDate();
@@ -701,8 +709,10 @@ function App() {
           currentYear={currentYear}
           teacherLogin={teacher.login}
           onClose={() => setSelected(null)}
-          onSaved={async () => {
-            await reloadStudents();
+          onSaved={(updatedFields) => {
+            setStudents(prev => prev.map(s => 
+              s.rowIndex === selected.rowIndex ? { ...s, ...updatedFields } : s
+            ));
             setSelected(null);
             setToast('✓ Đã lưu vào Google Sheet');
             setTimeout(() => setToast(null), 2500);
@@ -721,8 +731,13 @@ function App() {
           currentYear={selectedMonthly.year}
           teacherLogin={teacher.login}
           onClose={() => setSelectedMonthly(null)}
-          onSaved={async () => {
-            await reloadMonthly();
+          onSaved={(updatedFields) => {
+            setMonthlyStudents(prev => prev.map(s => 
+              (s.rowIndex === selectedMonthly.rowIndex && s.fileId === selectedMonthly.fileId) 
+                ? { ...s, ...updatedFields } 
+                : s
+            ));
+            setSelectedMonthly(null);
             setToast('✓ Đã lưu báo cáo tháng');
             setTimeout(() => setToast(null), 2500);
           }}
@@ -779,12 +794,29 @@ Nhận xét của thầy cô:
 ${note}`;
 
   const handleSave = async () => {
+    const missingFields = [];
+    if (!statusEvaluation || !statusEvaluation.trim()) missingFields.push("Đánh giá chung");
+    if (!student.is_absent) {
+      if (!scoreB1 || !scoreB1.trim()) missingFields.push("Điểm BTVN buổi 1");
+      if (!scoreB2 || !scoreB2.trim()) missingFields.push("Điểm BTVN buổi 2");
+    }
+    if (!note || !note.trim()) missingFields.push("Nhận xét chung");
+
+    if (missingFields.length > 0) {
+      alert("Không thể lưu! Vui lòng điền đầy đủ các trường:\n• " + missingFields.join("\n• "));
+      return;
+    }
     setSaving(true);
-    // fileId truyền vào đây đã là activeWeekFileId (đúng file dù tuần thuộc T hay T-1)
-    const result = await callApi('saveFeedback', fileId, tab, student.rowIndex, note, generateParent(), teacherLogin, scoreB1, scoreB2, statusEvaluation);
+    // fileId truyền vào đây đã là activeWeekFileId (đúng file dù tuần thuộc T hay T-1), kèm student_id để chống lệch dòng
+    const result = await callApi('saveFeedback', fileId, tab, student.rowIndex, note, generateParent(), teacherLogin, scoreB1, scoreB2, statusEvaluation, student.student_id);
     setSaving(false);
     if (result.error) alert('Lỗi: ' + result.error);
-    else onSaved();
+    else onSaved({
+      feedback_text: note,
+      score_b1: scoreB1,
+      score_b2: scoreB2,
+      status: statusEvaluation
+    });
   };
 
   const copyParent = async () => {
@@ -964,26 +996,60 @@ function MonthlyDetailPanel({ student, fileId, currentMonth, currentYear, teache
   const updateField = (k, v) => setFields(prev => ({ ...prev, [k]: v }));
 
   const handleSave = async () => {
+    if (!fields.diem_dat_duoc || !fields.diem_dat_duoc.trim()) {
+      alert("Không thể lưu! Vui lòng điền đầy đủ: Điểm con đạt được");
+      return;
+    }
     setSaving(true);
-    // ── THAY ĐỔI: fileId là student.fileId (file tháng T hoặc T-1 tùy student)
-    const result = await callApi('saveMonthlyReport', fileId, student.rowIndex, fields, teacherLogin);
+    // ── THAY ĐỔI: fileId là student.fileId, truyền thêm student_id để chống lệch dòng
+    const result = await callApi('saveMonthlyReport', fileId, student.rowIndex, fields, teacherLogin, student.student_id);
     setSaving(false);
     if (result.error) alert('Lỗi: ' + result.error);
-    else onSaved();
+    else onSaved({
+      diem_dat_duoc: fields.diem_dat_duoc,
+      kt_dat: fields.kt_dat,
+      kt_caithien: fields.kt_caithien,
+      kn_dat: fields.kn_dat,
+      kn_caithien: fields.kn_caithien,
+      td_dat: fields.td_dat,
+      td_caithien: fields.td_caithien,
+      khac_phuc: fields.khac_phuc,
+      giai_phap: fields.giai_phap,
+      is_done: !!(fields.kt_dat || fields.kn_dat || fields.td_dat)
+    });
   };
 
   const handleExportWord = async () => {
+    if (!fields.diem_dat_duoc || !fields.diem_dat_duoc.trim()) {
+      alert("Không thể xuất Word! Vui lòng điền đầy đủ: Điểm con đạt được");
+      return;
+    }
     if (!fields.kt_dat && !fields.kn_dat && !fields.td_dat) {
       alert('Vui lòng điền ít nhất các phần Đạt được trước khi xuất Word');
       return;
     }
     setExporting(true);
-    await callApi('saveMonthlyReport', fileId, student.rowIndex, fields, teacherLogin);
-    // ── THAY ĐỔI: truyền student.month và student.year thay vì currentMonth/currentYear chung
-    const result = await callApi('exportMonthlyReportToWord', fileId, student.rowIndex, teacherLogin, currentMonth, currentYear);
+    await callApi('saveMonthlyReport', fileId, student.rowIndex, fields, teacherLogin, student.student_id);
+    // ── THAY ĐỔI: truyền student.month và student.year và student_id
+    const result = await callApi('exportMonthlyReportToWord', fileId, student.rowIndex, teacherLogin, currentMonth, currentYear, student.student_id);
     setExporting(false);
     if (result.error) alert('Lỗi xuất Word: ' + result.error);
-    else window.open(result.url, '_blank');
+    else {
+      onSaved({
+        diem_dat_duoc: fields.diem_dat_duoc,
+        kt_dat: fields.kt_dat,
+        kt_caithien: fields.kt_caithien,
+        kn_dat: fields.kn_dat,
+        kn_caithien: fields.kn_caithien,
+        td_dat: fields.td_dat,
+        td_caithien: fields.td_caithien,
+        khac_phuc: fields.khac_phuc,
+        giai_phap: fields.giai_phap,
+        word_url: result.url,
+        is_done: true
+      });
+      window.open(result.url, '_blank');
+    }
   };
 
   const fetchAi = async () => {
