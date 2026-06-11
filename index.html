@@ -497,8 +497,12 @@ function App() {
                 const totalClass = actv.length;
                 const deadlineTs = deadlines[cls.class_code];
                 const countdown = deadlineTs ? formatCountdown(deadlineTs - nowTick) : null;
-                const allDone = done === totalClass;
-                const isViolated = allDone && violations.some(v => v.class_code === cls.class_code && v.week === activeWeek);
+                const allDone = totalClass > 0 && done === totalClass;
+                // Kiểm tra vi phạm: backend trả classCode (camelCase)
+                const hasViolationRecord = violations.some(v => v.classCode === cls.class_code && v.week === activeWeek);
+                // Nếu deadline đã qua mà lớp vẫn chưa done lúc deadline → coi là muộn
+                const isAfterDeadline = deadlineTs && deadlineTs < nowTick;
+                const isLate = allDone && (hasViolationRecord || isAfterDeadline);
                 return (
                   <section key={cls.class_code} className="fade-up" style={{animationDelay:`${i*60}ms`}}>
                     <div className="flex items-center gap-3 mb-3 flex-wrap">
@@ -512,8 +516,8 @@ function App() {
                           {countdown.text}
                         </span>
                       )}
-                      {allDone && isViolated && <span className="chip chip-warn">⚠ Hoàn thành muộn</span>}
-                      {allDone && !isViolated && <span className="chip chip-good">✓ Hoàn thành đúng hạn</span>}
+                      {allDone && isLate && <span className="chip chip-warn">⚠ Hoàn thành muộn</span>}
+                      {allDone && !isLate && <span className="chip chip-good">✓ Hoàn thành đúng hạn</span>}
                     </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                       {cls.students.map(s => {
