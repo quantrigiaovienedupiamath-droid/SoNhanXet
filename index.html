@@ -264,6 +264,7 @@ function App() {
   const [selectedMonthly, setSelectedMonthly] = useState(null);
   const [loadingMonthly, setLoadingMonthly] = useState(false);
   const [deadlines, setDeadlines] = useState({});
+  const [violations, setViolations] = useState([]);
   const [nowTick, setNowTick] = useState(Date.now());
 
   const now = new Date();
@@ -318,6 +319,7 @@ function App() {
       setActiveWeekFileId(data.activeWeekFileId);  // ← lưu fileId tuần active
       setStudents(data.students || []);
       setDeadlines(data.deadlines || {});
+      if (data.violations) setViolations(data.violations);
       setLoading(false);
     }).catch(e => { setError(e.toString()); setLoading(false); });
   }, [teacher?.login]);
@@ -334,6 +336,7 @@ function App() {
       if (data.error) { setError(data.error); setLoading(false); return; }
       setStudents(data.students || []);
       if (data.deadlines) setDeadlines(data.deadlines);
+      if (data.violations) setViolations(data.violations);
       setLoading(false);
     }).catch(e => { setError(e.toString()); setLoading(false); });
   }, [activeWeek, activeWeekFileId]);
@@ -495,6 +498,7 @@ function App() {
                 const deadlineTs = deadlines[cls.class_code];
                 const countdown = deadlineTs ? formatCountdown(deadlineTs - nowTick) : null;
                 const allDone = done === totalClass;
+                const isViolated = allDone && violations.some(v => v.class_code === cls.class_code && v.week === activeWeek);
                 return (
                   <section key={cls.class_code} className="fade-up" style={{animationDelay:`${i*60}ms`}}>
                     <div className="flex items-center gap-3 mb-3 flex-wrap">
@@ -508,7 +512,8 @@ function App() {
                           {countdown.text}
                         </span>
                       )}
-                      {countdown && allDone && <span className="chip chip-good">✓ Hoàn thành đúng hạn</span>}
+                      {allDone && isViolated && <span className="chip chip-warn">⚠ Hoàn thành muộn</span>}
+                      {allDone && !isViolated && <span className="chip chip-good">✓ Hoàn thành đúng hạn</span>}
                     </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                       {cls.students.map(s => {
