@@ -500,9 +500,7 @@ function App() {
                 const allDone = totalClass > 0 && done === totalClass;
                 // Kiểm tra vi phạm: backend trả classCode (camelCase)
                 const hasViolationRecord = violations.some(v => v.classCode === cls.class_code && v.week === activeWeek);
-                // Nếu deadline đã qua mà lớp vẫn chưa done lúc deadline → coi là muộn
-                const isAfterDeadline = deadlineTs && deadlineTs < nowTick;
-                const isLate = allDone && (hasViolationRecord || isAfterDeadline);
+                const isLate = allDone && hasViolationRecord;
                 return (
                   <section key={cls.class_code} className="fade-up" style={{animationDelay:`${i*60}ms`}}>
                     <div className="flex items-center gap-3 mb-3 flex-wrap">
@@ -550,8 +548,9 @@ function App() {
                               </div>
                             )}
                             {s.status && (
-                              <div className="mt-3 pt-3 border-t border-dashed border-[var(--line)] text-xs font-mono text-[var(--muted)]">
-                                Đánh giá: <span className="text-[var(--ink)] font-medium">{s.status}</span>
+                              <div className="mt-3 pt-3 border-t border-dashed border-[var(--line)] text-xs font-mono text-[var(--muted)] flex justify-between items-center flex-wrap gap-1">
+                                <span>Đánh giá: <span className="text-[var(--ink)] font-medium">{s.status}</span></span>
+                                {s.updated_at && <span style={{fontSize: '9px'}} className="text-[var(--muted)] font-mono">🕒 {s.updated_at}</span>}
                               </div>
                             )}
                           </button>
@@ -823,7 +822,8 @@ ${note}`;
       feedback_text: note,
       score_b1: scoreB1,
       score_b2: scoreB2,
-      status: statusEvaluation
+      status: statusEvaluation,
+      updated_at: result.updated_at
     });
   };
 
@@ -848,7 +848,10 @@ ${note}`;
             <div className="flex-1 min-w-0">
               <p className="text-xs font-mono text-[var(--muted)] uppercase tracking-wider truncate">{student.class_code} · {student.week}</p>
               <h2 className="font-display font-semibold text-2xl mt-1">{student.full_name}</h2>
-              <p className="text-xs font-mono text-[var(--muted)] mt-2">ID: {student.student_id} · Bắt đầu: {student.start_date}</p>
+              <p className="text-xs font-mono text-[var(--muted)] mt-2">
+                ID: {student.student_id} · Bắt đầu: {student.start_date}
+                {student.updated_at && ` · Cập nhật: ${student.updated_at}`}
+              </p>
             </div>
             <button onClick={onClose} className="w-9 h-9 rounded-md ghost-btn grid place-items-center text-xl font-light">×</button>
           </div>
