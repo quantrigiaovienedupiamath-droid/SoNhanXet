@@ -986,10 +986,20 @@ ${note}`;
   );
 }
 
+// ── Helper to normalize score ───────────────────────────────
+function normalizeScore(val) {
+  if (val == null) return '';
+  let str = String(val).trim();
+  if (/^\d+\.\d+$/.test(str)) {
+    str = str.replace('.', ',');
+  }
+  return str;
+}
+
 // ── Monthly detail panel ────────────────────────────────────
 function MonthlyDetailPanel({ student, fileId, currentMonth, currentYear, teacherLogin, onClose, onSaved }) {
   const [fields, setFields] = useState({
-    diem_dat_duoc: student.diem_dat_duoc != null ? String(student.diem_dat_duoc) : '',
+    diem_dat_duoc: student.diem_dat_duoc != null ? normalizeScore(student.diem_dat_duoc) : '',
     kt_dat:        student.kt_dat        != null ? String(student.kt_dat)        : '',
     kt_caithien:   student.kt_caithien   != null ? String(student.kt_caithien)   : '',
     kn_dat:        student.kn_dat        != null ? String(student.kn_dat)        : '',
@@ -1003,6 +1013,18 @@ function MonthlyDetailPanel({ student, fileId, currentMonth, currentYear, teache
   const [exporting, setExporting] = useState(false);
   const [loadingAi, setLoadingAi] = useState(false);
   const [aiResult, setAiResult] = useState(null);
+
+  const scoreOptions = [];
+  for (let i = 10; i >= 0; i -= 0.5) {
+    scoreOptions.push(String(i).replace('.', ','));
+  }
+  scoreOptions.push("Con chưa làm");
+  scoreOptions.push("Con rời lớp");
+
+  const renderedOptions = [...scoreOptions];
+  if (fields.diem_dat_duoc && !scoreOptions.includes(fields.diem_dat_duoc)) {
+    renderedOptions.push(fields.diem_dat_duoc);
+  }
 
   const updateField = (k, v) => setFields(prev => ({ ...prev, [k]: v }));
 
@@ -1118,8 +1140,13 @@ function MonthlyDetailPanel({ student, fileId, currentMonth, currentYear, teache
 
           <div>
             <label className="block text-xs font-mono uppercase tracking-wider text-[var(--muted)] mb-2">Điểm con đạt được</label>
-            <input type="text" className="field w-full" placeholder="VD: 8.5 hoặc 'chưa có'"
-              value={fields.diem_dat_duoc} onChange={e => updateField('diem_dat_duoc', e.target.value)} />
+            <select className="field w-full"
+              value={fields.diem_dat_duoc} onChange={e => updateField('diem_dat_duoc', e.target.value)}>
+              <option value="">-- Chọn điểm --</option>
+              {renderedOptions.map(opt => (
+                <option key={opt} value={opt}>{opt}</option>
+              ))}
+            </select>
           </div>
 
           {[
