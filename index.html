@@ -11,7 +11,7 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.22.20/babel.min.js"></script>
 <style>
   :root {
     --ink: #133849; --paper: #fdfbf4; --paper-2: #f4ede0;
@@ -52,7 +52,7 @@
 <body>
 <div id="root"><div style="min-height:100vh;display:grid;place-items:center;font-family:Geist,sans-serif;color:#5d6b58">Đang tải...</div></div>
 
-<script type="text/babel">
+<script type="text/babel" data-presets="env,react">
 const { useState, useEffect, useMemo } = React;
 const LOGO_URL = "./logo.jpg";
 
