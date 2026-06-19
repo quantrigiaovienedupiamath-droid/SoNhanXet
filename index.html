@@ -149,6 +149,18 @@ function callApi(method, ...args) {
 }
 
 
+function parseVNDateTime(str) {
+  if (!str) return null;
+  const parts = str.trim().split(/[\s/:]+/);
+  if (parts.length < 5) return null;
+  const day = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1;
+  const year = parseInt(parts[2], 10);
+  const hour = parseInt(parts[3], 10);
+  const minute = parseInt(parts[4], 10);
+  return new Date(year, month, day, hour, minute);
+}
+
 function parseScore(raw) {
   if (raw === null || raw === undefined || raw === '') return null;
   const s = raw.toString().trim().toLowerCase();
@@ -498,9 +510,20 @@ function App() {
                 const deadlineTs = deadlines[cls.class_code];
                 const countdown = deadlineTs ? formatCountdown(deadlineTs - nowTick) : null;
                 const allDone = totalClass > 0 && done === totalClass;
-                // Kiểm tra vi phạm: backend trả classCode (camelCase)
-                const hasViolationRecord = violations.some(v => v.classCode === cls.class_code && v.week === activeWeek);
-                const isLate = allDone && hasViolationRecord;
+                
+                let isLate = false;
+                if (allDone && deadlineTs) {
+                  for (const s of cls.students) {
+                    if (s.is_absent) continue;
+                    if (!s.feedback_text || !s.feedback_text.trim()) continue;
+                    if (!s.updated_at) continue;
+                    const updateTime = parseVNDateTime(s.updated_at);
+                    if (updateTime && updateTime.getTime() > deadlineTs) {
+                      isLate = true;
+                      break;
+                    }
+                  }
+                }
                 return (
                   <section key={cls.class_code} className="fade-up" style={{animationDelay:`${i*60}ms`}}>
                     <div className="flex items-center gap-3 mb-3 flex-wrap">
@@ -804,8 +827,14 @@ ${note}`;
     const missingFields = [];
     if (!student.is_absent) {
       if (!statusEvaluation || !statusEvaluation.trim()) missingFields.push("Đánh giá chung");
-      if (!scoreB1 || !scoreB1.trim()) missingFields.push("Điểm BTVN buổi 1");
-      if (!scoreB2 || !scoreB2.trim()) missingFields.push("Điểm BTVN buổi 2");
+      
+      const noteStr = student.note || "";
+      const missedB1 = noteStr.indexOf("Nghỉ B1") >= 0;
+      const missedB2 = noteStr.indexOf("Nghỉ B2") >= 0;
+      
+      if (!missedB1 && (!scoreB1 || !scoreB1.trim())) missingFields.push("Điểm BTVN buổi 1");
+      if (!missedB2 && (!scoreB2 || !scoreB2.trim())) missingFields.push("Điểm BTVN buổi 2");
+      
       if (!note || !note.trim()) missingFields.push("Nhận xét chung");
     }
 
