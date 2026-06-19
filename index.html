@@ -783,14 +783,30 @@ function App() {
 function DetailPanel({ student, fileId, tab, currentMonth, currentYear, teacherLogin, onClose, onSaved }) {
   const [view, setView] = useState('write');
   const [note, setNote] = useState(student.feedback_text != null ? String(student.feedback_text) : '');
-  const [scoreB1, setScoreB1] = useState(student.score_b1 != null ? String(student.score_b1) : '');
-  const [scoreB2, setScoreB2] = useState(student.score_b2 != null ? String(student.score_b2) : '');
+  const [scoreB1, setScoreB1] = useState(student.score_b1 != null ? normalizeScore(student.score_b1) : '');
+  const [scoreB2, setScoreB2] = useState(student.score_b2 != null ? normalizeScore(student.score_b2) : '');
   const [statusEvaluation, setStatusEvaluation] = useState(student.status != null ? String(student.status) : '');
   const [suggestion, setSuggestion] = useState('');
   const [loadingAi, setLoadingAi] = useState(false);
   const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
   const [history, setHistory] = useState([]);
+
+  const baseOptions = [];
+  for (let i = 10; i >= 0; i -= 0.5) {
+    baseOptions.push(String(i).replace('.', ','));
+  }
+  baseOptions.push("Con chưa làm", "Con nghỉ", "Con rời lớp", "Con mới học");
+
+  const renderedOptionsB1 = [...baseOptions];
+  if (scoreB1 && !baseOptions.includes(scoreB1)) {
+    renderedOptionsB1.push(scoreB1);
+  }
+
+  const renderedOptionsB2 = [...baseOptions];
+  if (scoreB2 && !baseOptions.includes(scoreB2)) {
+    renderedOptionsB2.push(scoreB2);
+  }
 
   useEffect(() => {
     // ── THAY ĐỔI: getStudentHistory đã cập nhật backend để trả về cả T và T-1
@@ -931,15 +947,25 @@ ${note}`;
                 </div>
                 <div>
                   <label className="text-xs font-mono text-[var(--muted)] uppercase mb-2 block">BTVN B1</label>
-                  <input type="text" className="field w-full text-center font-display text-lg font-semibold"
-                    style={{padding:'6px 10px'}} placeholder="—"
-                    value={scoreB1} onChange={e => setScoreB1(e.target.value)} disabled={student.is_absent} />
+                  <select className="field w-full text-center font-display text-sm font-semibold"
+                    style={{padding:'8px 10px'}}
+                    value={scoreB1} onChange={e => setScoreB1(e.target.value)} disabled={student.is_absent}>
+                    <option value="">— Chọn —</option>
+                    {renderedOptionsB1.map(opt => (
+                      <option key={opt} value={opt}>{opt}</option>
+                    ))}
+                  </select>
                 </div>
                 <div>
                   <label className="text-xs font-mono text-[var(--muted)] uppercase mb-2 block">BTVN B2</label>
-                  <input type="text" className="field w-full text-center font-display text-lg font-semibold"
-                    style={{padding:'6px 10px'}} placeholder="—"
-                    value={scoreB2} onChange={e => setScoreB2(e.target.value)} disabled={student.is_absent} />
+                  <select className="field w-full text-center font-display text-sm font-semibold"
+                    style={{padding:'8px 10px'}}
+                    value={scoreB2} onChange={e => setScoreB2(e.target.value)} disabled={student.is_absent}>
+                    <option value="">— Chọn —</option>
+                    {renderedOptionsB2.map(opt => (
+                      <option key={opt} value={opt}>{opt}</option>
+                    ))}
+                  </select>
                 </div>
               </div>
 
