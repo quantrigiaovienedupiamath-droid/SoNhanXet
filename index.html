@@ -556,7 +556,10 @@ function App() {
                             {s.is_absent && !s.is_gifted && <div className="absolute top-2 right-2"><span style={{background:'#888780',color:'white',padding:'2px 8px',borderRadius:'999px',fontSize:'10px',fontWeight:'600'}}>Nghỉ cả tuần</span></div>}
                             {hasNote && !s.is_gifted && !s.is_absent && <div className="absolute top-2 right-2"><span className="stamp">đã NX</span></div>}
                             <h3 className="font-display font-semibold text-lg leading-tight pr-20">{s.full_name}</h3>
-                            <p className="text-xs text-[var(--muted)] font-mono mt-0.5">ID: {s.student_id}</p>
+                            <p className="text-xs text-[var(--muted)] font-mono mt-0.5">
+                              ID: {s.student_id}
+                              {s.attendance_status === 'Nghỉ 1 buổi' && <span className="ml-2 px-2 py-0.5 bg-orange-100 text-orange-800 rounded-full text-[10px] font-semibold">Nghỉ 1 buổi</span>}
+                            </p>
                             {s.note && <p className="text-xs mt-2 italic" style={{color:s.is_gifted?'#854F0B':'var(--muted)'}}>{s.note}</p>}
                             {!s.is_absent && (
                               <div className="flex items-center gap-3 mt-3 flex-wrap">

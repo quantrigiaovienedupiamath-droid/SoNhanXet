@@ -1,0 +1,2982 @@
+// ============================================================
+// SỔ NHẬN XÉT - Google Apps Script Backend v2
+// ============================================================
+// Workflow mới:
+//   1. Admin paste data buổi học hàng ngày vào tab _DailySessions
+//   2. Cron sáng quét data → tạo/update file Nhận xét tháng tương ứng
+//   3. GV vào app viết nhận xét cho từng HS đã được app gom sẵn theo tuần
+//
+// Cấu trúc file lịch lớp ("Quản trị lịch lớp học Mathtutor") cần có:
+//   - Tab "Danh sách lớp Edupia Math": cột D=Mã lớp, E=Code GS, K=Bậc, L=Ngày B1, M=Giờ B1, N=Ngày B2, O=Giờ B2
+//   - Tab _Teachers (ẩn): login | email | full_name
+//   - Tab _DailySessions: date | student_id | full_name | class_code | status
+//   - Tab _GiftedSessions: month | year | student_id | full_name | note
+// ============================================================
+
+const CONFIG = {
+  LICH_LOP_SHEET_ID: '1w-dXcNTQcfIlWH5YX2fqKLQNBYnj9E8TWHy8Sj7aJ30',
+  NX_FOLDER_ID: '1EAi_G0k77Gmve67_OtUSvBoCeoW1klhF',
+  ADMIN_EMAIL: 'quantrigiaovienedupiamath@gmail.com',
+  TEMPLATE_FILE_ID: '1hv4_33jb9Szj8PeohYu6MtCxHXe5lT8bGBArI9VsOOo',
+  VIOLATION_SHEET_ID: '19AbBxxLI3NdEDEn98JBW-CDVCYMmEfL1B2zcq66lo3w',
+  LMS_EXPORT_SHEET_ID: '1hiTRWZQPcMeJPWDhSkiv-dzsNspekt-efUYJLPfBwtw',
+  LMS_EXPORT_TAB_NAME: 'Trang tính1',
+  // Báo cáo tháng deadline = ngày X của tháng T+1
+  MONTHLY_REPORT_DEADLINE_DAY: 10,
+};
+
+// Múi giờ Việt Nam (giờ buổi học = 19h, 20h... theo giờ VN)
+const TIMEZONE = 'GMT+7';
+
+// Giờ deadline trong ngày T+1 (vd: deadline là 23:59 ngày T+1)
+const DEADLINE_HOUR = 23;
+const DEADLINE_MINUTE = 59;
+
+const DAY_MAP = {
+  'Chủ nhật': 0, 'Chủ Nhật': 0, 'CN': 0, 'chu nhat': 0,
+  'Thứ 2': 1, 'Thu 2': 1, 'T2': 1, 'Thứ Hai': 1, 'Thu Hai': 1,
+  'Thứ 3': 2, 'Thu 3': 2, 'T3': 2, 'Thứ Ba': 2, 'Thu Ba': 2,
+  'Thứ 4': 3, 'Thu 4': 3, 'T4': 3, 'Thứ Tư': 3, 'Thu Tu': 3,
+  'Thứ 5': 4, 'Thu 5': 4, 'T5': 4, 'Thứ Năm': 4, 'Thu Nam': 4,
+  'Thứ 6': 5, 'Thu 6': 5, 'T6': 5, 'Thứ Sáu': 5, 'Thu Sau': 5,
+  'Thứ 7': 6, 'Thu 7': 6, 'T7': 6, 'Thứ Bảy': 6, 'Thu Bay': 6,
+};
+
+// Fallback: nếu DAY_MAP không nhận ra, thử rút số từ chuỗi (vd "Thứ 3" -> 3 -> map sang 2)
+function getDayNum(dayStr) {
+  if (!dayStr) return undefined;
+  const s = dayStr.toString().trim();
+  if (DAY_MAP[s] !== undefined) return DAY_MAP[s];
+  // Thử lowercase
+  const sl = s.toLowerCase().replace(/\s+/g, ' ');
+  for (const k in DAY_MAP) {
+    if (k.toLowerCase().replace(/\s+/g, ' ') === sl) return DAY_MAP[k];
+  }
+  // Rút số cuối: "Thứ 3" -> 3 -> return 3-1=2 (dow: CN=0,T2=1,...T7=6)
+  const m = s.match(/(\d)/);
+  if (m) {
+    const n = parseInt(m[1]);
+    if (n >= 2 && n <= 7) return n - 1; // T2->1, T3->2, ..., T7->6
+    if (n === 0 || s.toLowerCase().indexOf('ch') >= 0) return 0; // CN
+  }
+  return undefined;
+}
+
+const STATUS_SUCCESS = 'Thành công';
+const STATUS_STUDENT_CANCEL = 'Hủy do HV không bù';
+const STATUS_TEACHER_CANCEL = 'Huỷ do giáo viên';
+
+// ============================================================
+// ENTRY POINT
+// ============================================================
+function doGet(e) {
+  return HtmlService.createTemplateFromFile('index')
+    .evaluate()
+    .setTitle('Sổ Nhận Xét')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+// ============================================================
+// AUTH
+// ============================================================
+
+function authenticate(login, password) {
+  if (!login || !password) return { error: 'Thiếu tài khoản hoặc mật khẩu' };
+
+  const ss = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
+  const sheet = ss.getSheetByName('_Teachers');
+  if (!sheet) return { error: 'Chưa tạo tab _Teachers' };
+
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if ((r[0] || '').toString().toLowerCase() === login.toLowerCase() &&
+        (r[1] || '').toString() === password) {
+      return {
+        login: r[0],
+        email: r[2] || '',
+        full_name: r[3] || r[0],
+      };
+    }
+  }
+  return { error: 'Sai tài khoản hoặc mật khẩu' };
+}
+
+function getTeachersMap() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get('teachers_map');
+  if (cached) return JSON.parse(cached);
+
+  const ss = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
+  const sheet = ss.getSheetByName('_Teachers');
+  if (!sheet) return {};
+  const data = sheet.getDataRange().getValues();
+  const map = {};
+  for (let i = 1; i < data.length; i++) {
+    const login = (data[i][0] || '').toString().toLowerCase().trim();
+    if (!login) continue;
+    map[login] = {
+      login: data[i][0],
+      email: data[i][2] || '',
+      full_name: data[i][3] || data[i][0]
+    };
+  }
+  try {
+    cache.put('teachers_map', JSON.stringify(map), 1800); // cache 30 mins
+  } catch (e) {}
+  return map;
+}
+
+function getTeacherByLogin(login) {
+  if (!login) return null;
+  const map = getTeachersMap();
+  return map[login.toLowerCase().trim()] || null;
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+function normalizeClassCode(raw) {
+  if (!raw) return '';
+  const s = raw.toString().trim();
+  const idx = s.indexOf('-');
+  return idx > 0 ? s.substring(0, idx) : s;
+}
+
+function parseVNDate(str) {
+  if (!str) return null;
+  if (str instanceof Date) return str;
+  const m = str.toString().match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (!m) return null;
+  return new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
+}
+
+function getMondayOfWeek(d) {
+  const monday = new Date(d);
+  const dow = d.getDay();
+  const offset = dow === 0 ? -6 : 1 - dow;
+  monday.setDate(d.getDate() + offset);
+  return monday;
+}
+
+function formatDayMonth(d) {
+  const dd = ('0' + d.getDate()).slice(-2);
+  const mm = ('0' + (d.getMonth() + 1)).slice(-2);
+  return dd + '/' + mm;
+}
+
+function getWeekRange(d) {
+  const monday = getMondayOfWeek(d);
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
+  return formatDayMonth(monday) + ' - ' + formatDayMonth(sunday);
+}
+
+/**
+ * Helper: trả về tháng/năm trước đó
+ */
+function getPrevMonth(month, year) {
+  return month === 1
+    ? { month: 12, year: year - 1 }
+    : { month: month - 1, year: year };
+}
+
+// ============================================================
+// READ: lịch lớp (có cache 5 phút)
+// ============================================================
+function loadClassSchedules() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get('class_schedules_compressed');
+  if (cached) {
+    try {
+      const parsed = JSON.parse(cached);
+      const map = {};
+      for (const key in parsed) {
+        const arr = parsed[key];
+        map[key] = {
+          class_code: key,
+          teacher_login: arr[0],
+          pic: arr[1],
+          level: arr[2],
+          day1: arr[3],
+          time1: arr[4],
+          day2: arr[5],
+          time2: arr[6],
+          day1_num: arr[7],
+          day2_num: arr[8]
+        };
+      }
+      return map;
+    } catch (e) {}
+  }
+
+  const ss = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
+  const sheet = ss.getSheetByName('Danh sách lớp Edupia Math');
+  if (!sheet) throw new Error('Không tìm thấy tab Danh sách lớp Edupia Math');
+
+  const data = sheet.getDataRange().getValues();
+  const map = {};
+  
+  const headerRow = data[0] || [];
+  let picIdx = -1;
+  for (let j = 0; j < headerRow.length; j++) {
+    const h = (headerRow[j] || '').toString().trim().toUpperCase();
+    // Khớp cả 'PIC' và 'PIC GVCN' (cột R trong file Quản trị lịch)
+    if (h === 'PIC' || h === 'PIC GVCN') {
+      picIdx = j;
+      break;
+    }
+  }
+  // Fallback: nếu không tìm thấy header, dùng cột R cố định (index 17)
+  if (picIdx < 0) picIdx = 17;
+
+  const compressed = {};
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (!r[3]) continue;
+    const class_code = r[3];
+    const day1_num = getDayNum(r[11]);
+    const day2_num = getDayNum(r[13]);
+    
+    map[class_code] = {
+      class_code: class_code,
+      teacher_login: (r[4] || '').toString(),
+      pic: (r[picIdx] || '').toString(),
+      level: r[10] || '',
+      day1: r[11] || '',
+      time1: r[12] || '',
+      day2: r[13] || '',
+      time2: r[14] || '',
+      day1_num: day1_num,
+      day2_num: day2_num,
+    };
+    
+    compressed[class_code] = [
+      (r[4] || '').toString(),
+      (r[picIdx] || '').toString(),
+      r[10] || '',
+      r[11] || '',
+      r[12] || '',
+      r[13] || '',
+      r[14] || '',
+      day1_num,
+      day2_num
+    ];
+  }
+  try {
+    cache.put('class_schedules_compressed', JSON.stringify(compressed), 300);
+  } catch (e) {}
+  return map;
+}
+
+function getTeacherClasses(login) {
+  const teacher = getTeacherByLogin(login);
+  if (!teacher) return { error: 'Tài khoản không tồn tại' };
+
+  const schedules = loadClassSchedules();
+  const classes = Object.values(schedules).filter(
+    c => c.teacher_login.toLowerCase() === teacher.login.toLowerCase()
+  );
+  return { teacher, classes };
+}
+
+// ============================================================
+// API GỘP: load toàn bộ dashboard data trong 1 call
+// THAY ĐỔI: merge tuần của tháng T và tháng T-1
+//           mỗi week object có thêm trường fileId để frontend dùng đúng file
+// ============================================================
+function loadDashboardData(login, month, year) {
+  const teacher = getTeacherByLogin(login);
+  if (!teacher) return { error: 'Tài khoản không tồn tại' };
+
+  const schedules = loadClassSchedules();
+  const classes = Object.values(schedules).filter(
+    c => c.teacher_login.toLowerCase() === teacher.login.toLowerCase()
+  );
+
+  const file     = findMonthlyFile(month, year);
+  const prev     = getPrevMonth(month, year);
+  const prevFile = findMonthlyFile(prev.month, prev.year);
+
+  if (!file && !prevFile) {
+    return {
+      teacher, classes, weeks: [], file: null,
+      deadlines: {}, students: [], activeWeek: null, activeWeekFileId: null,
+    };
+  }
+
+  // ── Hàm extract danh sách tab từ 1 Spreadsheet ─────────────
+  function extractTabs(ss, fileId, refYear) {
+    return ss.getSheets()
+      .filter(function(s) {
+        const n = s.getName();
+        return !n.startsWith('_') && n !== 'Monthly';
+      })
+      .map(function(s) {
+        const name = s.getName();
+        const m = name.replace(/\s+/g, '').match(/(\d+)\/(\d+)-(\d+)\/(\d+)/);
+        if (!m) return null;
+        const day = parseInt(m[1]);
+        const mon = parseInt(m[2]);
+        const weekInMonth = Math.floor((day - 1) / 7) + 1;
+        return {
+          id: name,
+          fileId: fileId,
+          label: 'Tuần ' + weekInMonth + ' tháng ' + mon,
+          range: m[1] + '/' + m[2] + ' - ' + m[3] + '/' + m[4],
+          // sortKey mã hoá năm để sort đúng thứ tự dù khác năm
+          sortKey: (refYear * 10000) + (mon * 100) + day,
+        };
+      })
+      .filter(Boolean);
+  }
+
+  let allTabs = [];
+  let fileSS = null, prevFileSS = null;
+  if (file)     { fileSS     = SpreadsheetApp.openById(file.id);     allTabs = allTabs.concat(extractTabs(fileSS,     file.id,     year)); }
+  if (prevFile) { prevFileSS = SpreadsheetApp.openById(prevFile.id); allTabs = allTabs.concat(extractTabs(prevFileSS, prevFile.id, prev.year)); }
+  // Sắp xếp giảm dần: tuần mới nhất lên đầu
+  allTabs.sort(function(a, b) { return b.sortKey - a.sortKey; });
+
+  const weeks = allTabs.map(function(t) {
+    return { id: t.id, fileId: t.fileId, label: t.label, range: t.range };
+  });
+
+  // ── Chọn activeWeek: tuần chứa today, nếu không thì tab đầu ─
+  const now = new Date();
+  let activeWeek = null, activeWeekFileId = null;
+  for (let i = 0; i < allTabs.length; i++) {
+    const t = allTabs[i];
+    const m = t.range.replace(/\s+/g, '').match(/(\d+)\/(\d+)-(\d+)\/(\d+)/);
+    if (!m) continue;
+    const tabYear   = Math.floor(t.sortKey / 10000);
+    const startDate = new Date(tabYear, parseInt(m[2]) - 1, parseInt(m[1]));
+    const endDate   = new Date(tabYear, parseInt(m[4]) - 1, parseInt(m[3]));
+    endDate.setHours(23, 59, 59);
+    if (now >= startDate && now <= endDate) {
+      activeWeek = t.id;
+      activeWeekFileId = t.fileId;
+      break;
+    }
+  }
+  if (!activeWeek && allTabs.length > 0) {
+    activeWeek = allTabs[0].id;
+    activeWeekFileId = allTabs[0].fileId;
+  }
+
+  // ── Load students của activeWeek từ đúng file ───────────────
+  let students = [];
+  if (activeWeek && activeWeekFileId) {
+    // Tái sử dụng object đã mở, không gọi openById lại
+    const activeSS = (file && activeWeekFileId === file.id) ? fileSS
+                   : (prevFile && activeWeekFileId === prevFile.id) ? prevFileSS
+                   : SpreadsheetApp.openById(activeWeekFileId);
+    const sheet = activeSS.getSheetByName(activeWeek);
+    if (sheet) {
+      const data = sheet.getDataRange().getValues();
+      // Chỉ hiển thị học sinh có cột F (teacher_login) khớp với login của GV đang đăng nhập
+      // Cột F đã được gán đúng từ aggregateWeekly theo GV chuyên môn dạy Buổi 2
+      for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+        if (!row[1]) continue;
+        const rowTeacher = (row[5] || '').toString().toLowerCase();
+        if (rowTeacher !== teacher.login.toLowerCase()) continue;
+        students.push({
+          rowIndex: i + 1,
+          week: row[0],
+          student_id: row[1].toString(),
+          full_name: row[2],
+          start_date: row[3] instanceof Date
+            ? Utilities.formatDate(row[3], 'GMT+7', 'dd/MM/yyyy') : row[3],
+          class_code: row[4],
+          teacher_login: rowTeacher,
+          note: row[6] || '',
+          status: row[7] || '',
+          score_b1: row[8],
+          score_b2: row[9],
+          feedback_text: row[10] || '',
+          is_gifted: (row[6] || '').toString().indexOf('🎁') >= 0,
+          is_absent: (row[12] || '').toString() === 'Nghỉ',
+          attendance_status: row[12] || '',
+          updated_at: row[14] ? (row[14] instanceof Date ? Utilities.formatDate(row[14], 'GMT+7', 'dd/MM/yyyy HH:mm') : row[14].toString()) : '',
+        });
+      }
+    }
+  }
+
+  // ── Tính deadlines cho activeWeek ──────────────────────────
+  const deadlines = {};
+  if (activeWeek) {
+    const activeTabFull = allTabs.find(function(t) { return t.id === activeWeek; });
+    const deadlineYear  = activeTabFull ? Math.floor(activeTabFull.sortKey / 10000) : year;
+    const activeWeekObj = weeks.find(function(w) { return w.id === activeWeek; });
+    if (activeWeekObj) {
+      // Tính deadline dựa trên các lớp thực tế GV đang dạy trong tuần (từ sheet tuần)
+      // Lấy danh sách class_code unique từ students đã load
+      const classCodesInWeek = new Set(students.map(function(s) { return s.class_code; }));
+      classCodesInWeek.forEach(function(code) {
+        const sched = schedules[code];
+        if (!sched) return;
+        const dl = calcDeadline(activeWeekObj.range, sched, deadlineYear);
+        if (dl) deadlines[code] = dl.getTime();
+      });
+    }
+  }
+
+  return {
+    teacher:          teacher,
+    classes:          classes,
+    weeks:            weeks,       // mỗi week có thêm trường fileId
+    file:             file || prevFile,
+    activeWeek:       activeWeek,
+    activeWeekFileId: activeWeekFileId,  // fileId của tuần đang active
+    students:         students,
+    deadlines:        deadlines,
+    violations:       getTeacherViolations(login),
+    serverNow:        new Date().getTime(),
+  };
+}
+
+// ============================================================
+// READ: HS tặng buổi
+// ============================================================
+function loadGiftedSessions(month, year) {
+  const ss = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
+  const sheet = ss.getSheetByName('_GiftedSessions');
+  if (!sheet) return {};
+  const data = sheet.getDataRange().getValues();
+  const map = {};
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (!r[2]) continue;
+    if (parseInt(r[0]) === month && parseInt(r[1]) === year) {
+      map[r[2].toString()] = r[4] || 'Tặng buổi';
+    }
+  }
+  return map;
+}
+
+// ============================================================
+// CORE: tổng hợp data buổi học → file NX tháng
+// ============================================================
+function aggregateWeekly(filterMonth, filterYear) {
+  const ss = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
+  const dailySheet = ss.getSheetByName('_DailySessions');
+  if (!dailySheet) throw new Error('Chưa tạo tab _DailySessions');
+
+  const rows = dailySheet.getDataRange().getValues();
+  const schedules = loadClassSchedules();
+  const groups = {};
+
+  const debug = {
+    totalRows: rows.length - 1,
+    skipNoDate: 0,
+    skipNoStudent: 0,
+    skipTeacherCancel: 0,
+    skipClassNotFound: 0,
+    skipDayMismatch: 0,
+    processed: 0,
+    sampleClassNotFound: [],
+    sampleDayMismatch: [],
+  };
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const date = parseVNDate(r[0]);
+    if (!date) { debug.skipNoDate++; continue; }
+
+    // Lọc tháng nếu có truyền vào
+    if (filterMonth && filterYear) {
+      if (date.getMonth() + 1 !== filterMonth || date.getFullYear() !== filterYear) continue;
+    }
+
+    const studentId = r[1] ? r[1].toString() : '';
+    const fullName = r[2] || '';
+    const classCodeRaw = r[3] || '';
+    const status = (r[4] || '').toString().trim();
+    // Cột 6 (index 5) = specialist_teacher: giáo viên chuyên môn thực tế dạy buổi đó
+    const specialistTeacher = (r[5] || '').toString().trim().toLowerCase();
+
+    if (!studentId || !classCodeRaw) { debug.skipNoStudent++; continue; }
+    if (status === STATUS_TEACHER_CANCEL) { debug.skipTeacherCancel++; continue; }
+
+    const classNorm = normalizeClassCode(classCodeRaw);
+    const sched = schedules[classNorm];
+    if (!sched) {
+      debug.skipClassNotFound++;
+      if (debug.sampleClassNotFound.length < 3) {
+        debug.sampleClassNotFound.push(classCodeRaw + ' -> ' + classNorm);
+      }
+      continue;
+    }
+
+    const dow = date.getDay();
+    let session = null;
+    if (dow === sched.day1_num) session = 'B1';
+    else if (dow === sched.day2_num) session = 'B2';
+    else {
+      debug.skipDayMismatch++;
+      if (debug.sampleDayMismatch.length < 3) {
+        debug.sampleDayMismatch.push(
+          'date=' + Utilities.formatDate(date, 'GMT+7', 'dd/MM/yyyy') +
+          ' (dow=' + dow + ') class=' + classNorm +
+          ' B1=' + sched.day1 + '(' + sched.day1_num + ')' +
+          ' B2=' + sched.day2 + '(' + sched.day2_num + ')'
+        );
+      }
+      continue;
+    }
+
+    debug.processed++;
+    const weekRange = getWeekRange(date);
+    const month = date.getMonth() + 1;
+    const year = date.getFullYear();
+    const key = year + '-' + month + '_' + weekRange + '_' + classNorm + '_' + studentId;
+
+    if (!groups[key]) {
+      groups[key] = {
+        date: date, studentId: studentId, fullName: fullName,
+        classCode: classNorm, teacherLogin: sched.teacher_login,
+        week: weekRange, month: month, year: year,
+        b1: null, b2: null, b1Date: null, b2Date: null,
+        b1Teacher: null, b2Teacher: null,
+      };
+    }
+    if (session === 'B1') {
+      groups[key].b1 = status;
+      groups[key].b1Date = date;
+      if (specialistTeacher) groups[key].b1Teacher = specialistTeacher;
+    } else {
+      groups[key].b2 = status;
+      groups[key].b2Date = date;
+      if (specialistTeacher) groups[key].b2Teacher = specialistTeacher;
+    }
+  }
+
+  Logger.log('DEBUG aggregateWeekly: ' + JSON.stringify(debug, null, 2));
+
+  const byMonth = {};
+  for (const key in groups) {
+    const g = groups[key];
+    const mk = g.year + '-' + g.month;
+    if (!byMonth[mk]) byMonth[mk] = [];
+    byMonth[mk].push(g);
+  }
+
+  let totalWritten = 0;
+  for (const mk in byMonth) {
+    const parts = mk.split('-').map(Number);
+    const year = parts[0], month = parts[1];
+    const giftedMap = loadGiftedSessions(month, year);
+
+    let file = findMonthlyFile(month, year);
+    if (!file) file = createMonthlyFile(month, year);
+
+    const fileSS = SpreadsheetApp.openById(file.id);
+    const items = byMonth[mk];
+
+    const byWeek = {};
+    items.forEach(g => {
+      if (!byWeek[g.week]) byWeek[g.week] = [];
+      byWeek[g.week].push(g);
+    });
+
+    for (const week in byWeek) {
+      let tab = fileSS.getSheetByName(week);
+      if (!tab) {
+        tab = fileSS.insertSheet(week);
+        writeHeader(tab);
+      } else {
+        // Tự động nâng cấp tiêu đề bảng tuần cũ để bổ sung cột 'PIC' nếu chưa có
+        const lastCol = tab.getLastColumn();
+        const currentHeaders = lastCol > 0 ? tab.getRange(1, 1, 1, lastCol).getValues()[0] : [];
+        if (currentHeaders.indexOf('PIC') === -1) {
+          writeHeader(tab);
+        }
+      }
+
+      const existing = tab.getDataRange().getValues();
+      const existingKeys = {};
+      for (let i = 1; i < existing.length; i++) {
+        const r = existing[i];
+        if (!r[1] || !r[4]) continue;
+        existingKeys[r[1].toString() + '|' + r[4].toString()] = i + 1; // chỉ lưu rowIndex
+      }
+
+      const newRows = [];
+      const updates = [];
+
+      byWeek[week].forEach(g => {
+        const sched = schedules[g.classCode] || {};
+        const status = computeWeekStatus(g);
+        const note = computeNote(g, giftedMap[g.studentId]);
+        const startDate = g.b1Date || g.b2Date;
+        const startDateStr = startDate ? Utilities.formatDate(startDate, 'GMT+7', 'dd/MM/yyyy') : '';
+        const pic = sched.pic || '';
+
+        // Ưu tiên: GV dạy Buổi 2 > GV dạy Buổi 1 > GV mặc định từ lịch lớp
+        // Đây là GV chuyên môn thực tế dạy tuần đó (không phải GV backup)
+        const finalTeacherLogin = g.b2Teacher || g.b1Teacher || g.teacherLogin;
+
+        // Cột A-G: dữ liệu hệ thống (G: note học sinh tặng buổi)
+        // Cột H (index 7): Đánh giá chung xếp loại của GV -> để trống khi tạo mới
+        // Cột I,J (index 8,9): Điểm BTVN - do GV nhập qua web → để trống khi tạo mới
+        // Cột K,L (index 10,11): Nhận xét, mẫu PH - do GV nhập → để trống khi tạo mới
+        // Cột M (index 12): Trạng thái điểm danh tuần ("Học đủ" / "Nghỉ")
+        // Cột N (index 13): PIC - map từ mã lớp
+        const row = [
+          g.week, g.studentId, g.fullName, startDateStr,
+          g.classCode, finalTeacherLogin, note, '', // Để trống cột H
+          '', '', '', '', status, pic,           // Trạng thái điểm danh ghi vào cột M
+        ];
+
+        const k = g.studentId + '|' + g.classCode;
+        if (existingKeys[k]) {
+          // Dòng đã tồn tại: chỉ update A-G (metadata/note), M (status) và N (PIC)
+          // KHÔNG đụng H (evaluation) và I, J, K, L vì đó là dữ liệu GV đã nhập
+          updates.push({
+            rowIndex: existingKeys[k],
+            headerValues: row.slice(0, 7), // A-G (bao gồm cột F = finalTeacherLogin cập nhật mới)
+            statusValue: status,           // M
+            pic: pic                        // N
+          });
+        } else {
+          newRows.push(row);
+        }
+      });
+
+
+      if (newRows.length > 0) {
+        const startRow = tab.getLastRow() + 1;
+        tab.getRange(startRow, 1, newRows.length, newRows[0].length).setValues(newRows);
+        totalWritten += newRows.length;
+      }
+      if (updates.length > 0) {
+        updates.forEach(u => {
+          tab.getRange(u.rowIndex, 1, 1, 7).setValues([u.headerValues]); // Cập nhật A-G
+          tab.getRange(u.rowIndex, 13, 1, 2).setValues([[u.statusValue, u.pic]]); // Cập nhật M-N
+          // H (8), I (9), J (10), K (11), L (12) không bị đụng → dữ liệu GV an toàn
+        });
+      }
+
+      applyRowFormatting(tab);
+    }
+  }
+  return { ok: true, totalWritten: totalWritten };
+}
+
+// ── Chạy thủ công cho tháng hiện tại (nhanh ~5-10s) ──
+function aggregateCurrentMonth() {
+  const now = new Date();
+  const result = aggregateWeekly(now.getMonth() + 1, now.getFullYear());
+  Logger.log('aggregateCurrentMonth: ' + JSON.stringify(result));
+}
+
+// ── Chạy thủ công cho tháng trước (nhanh ~5-10s) ──
+function aggregatePrevMonth() {
+  const now = new Date();
+  let m = now.getMonth(); // getMonth() = tháng hiện tại - 1 (0-indexed)
+  let y = now.getFullYear();
+  if (m === 0) { m = 12; y--; }
+  const result = aggregateWeekly(m, y);
+  Logger.log('aggregatePrevMonth: ' + JSON.stringify(result));
+}
+
+// ── Dọn dẹp dữ liệu sai: xóa trạng thái điểm danh khỏi cột điểm I,J ──
+// Chạy 1 lần để sửa dữ liệu cũ bị ghi sai vào cột Điểm BTVN
+function cleanupWrongScores() {
+  const WRONG_VALUES = [
+    'Thành công', 'Thanh cong',
+    'Hủy do HV không bù', 'Huy do HV khong bu',
+    'Nghỉ', 'Nghi',
+    'Hủy do GV', 'Huy do GV',
+    'HV bù buổi', 'HV bu buoi',
+    'Chưa học', 'Chua hoc',
+    'Chưa bắt đầu', 'Chua bat dau',
+    'Học đủ', 'Hoc du'
+  ];
+
+  const now = new Date();
+  const months = [
+    { m: now.getMonth() + 1, y: now.getFullYear() },
+    { m: now.getMonth() === 0 ? 12 : now.getMonth(), y: now.getMonth() === 0 ? now.getFullYear() - 1 : now.getFullYear() },
+  ];
+
+  let totalFixed = 0;
+
+  months.forEach(function(mo) {
+    const file = findMonthlyFile(mo.m, mo.y);
+    if (!file) return;
+
+    const ss = SpreadsheetApp.openById(file.id);
+    const sheets = ss.getSheets();
+
+    sheets.forEach(function(sheet) {
+      const name = sheet.getName();
+      if (name === 'Monthly') return; // Bỏ qua tab báo cáo tháng
+
+      const lastRow = sheet.getLastRow();
+      if (lastRow < 2) return;
+
+        // Đọc cột G, H, I, J, K (cột 7, 8, 9, 10, 11)
+        const range = sheet.getRange(2, 7, lastRow - 1, 5);
+        const values = range.getValues();
+        let changed = false;
+
+        for (let i = 0; i < values.length; i++) {
+          // 1. Cột G (Note HS) - Chỉ giữ lại note tặng buổi (chứa kí tự '🎁'), xóa toàn bộ note tự sinh cũ
+          const valG = (values[i][0] || '').toString().trim();
+          if (valG && (WRONG_VALUES.some(w => valG.toLowerCase() === w.toLowerCase()) || valG.indexOf('🎁') === -1)) {
+            values[i][0] = '';
+            changed = true;
+            totalFixed++;
+          }
+
+          // 2. Cột H (Đánh giá chung) - Xóa nếu chứa trạng thái điểm danh Học đủ/Nghỉ và khôi phục đánh giá đúng từ nhận xét
+          const valH = (values[i][1] || '').toString().trim();
+          if (valH && (valH === 'Học đủ' || valH === 'Hoc du' || valH === 'Nghỉ' || valH === 'Nghi' || WRONG_VALUES.some(w => valH.toLowerCase() === w.toLowerCase()))) {
+            const comment = (values[i][4] || '').toString().trim();
+            values[i][1] = getEvaluationFromComment(comment);
+            changed = true;
+            totalFixed++;
+          }
+
+          // 3. Cột I và J (Điểm BTVN B1, B2) - Xóa nếu chứa trạng thái điểm danh
+          for (let j = 2; j <= 3; j++) {
+            const valCol = (values[i][j] || '').toString().trim();
+            if (valCol && WRONG_VALUES.some(w => valCol.toLowerCase() === w.toLowerCase())) {
+              values[i][j] = '';
+              changed = true;
+              totalFixed++;
+            }
+          }
+        }
+
+        if (changed) {
+          range.setValues(values);
+        }
+      });
+    });
+
+    Logger.log('cleanupWrongScores: đã dọn dẹp và khôi phục ' + totalFixed + ' ô');
+    return { ok: true, fixed: totalFixed };
+  }
+
+  // Hàm khôi phục Đánh giá chung từ Nhận xét của giáo viên
+  function getEvaluationFromComment(comment) {
+    if (!comment) return '';
+    const txt = comment.toLowerCase();
+    
+    if (txt.indexOf('xuất sắc') >= 0 || txt.indexOf('hoàn hảo') >= 0 || txt.indexOf('rất xuất sắc') >= 0) {
+      return 'Xuất sắc';
+    }
+    if (txt.indexOf('cần cố gắng') >= 0 || txt.indexOf('cố gắng hơn') >= 0 || txt.indexOf('chưa tốt') >= 0 || txt.indexOf('chưa tập trung') >= 0 || txt.indexOf('cần chú ý') >= 0 || txt.indexOf('chưa hoàn thành') >= 0 || txt.indexOf('nhắc nhở') >= 0) {
+      return 'Cần cố gắng';
+    }
+    if (txt.indexOf('rất tốt') >= 0 || txt.indexOf('tốt') >= 0 || txt.indexOf('khen') >= 0 || txt.indexOf('tích cực') >= 0 || txt.indexOf('chăm chỉ') >= 0) {
+      return 'Tốt';
+    }
+    if (txt.indexOf('khá') >= 0 || txt.indexOf('đạt') >= 0 || txt.indexOf('tiến bộ') >= 0 || txt.indexOf('hoàn thành') >= 0) {
+      return 'Đạt';
+    }
+    return 'Đạt'; // Mặc định là Đạt nếu có nhận xét nhưng không nhận diện được từ khóa
+  }
+
+function computeWeekStatus(g) {
+  const b1Ok = g.b1 === STATUS_SUCCESS;
+  const b2Ok = g.b2 === STATUS_SUCCESS;
+
+  const schedules = loadClassSchedules();
+  const sched = schedules[g.classCode];
+  
+  if (sched && sched.day2_num !== undefined) {
+    // Lớp học 2 buổi/tuần
+    if (b1Ok && b2Ok) {
+      return 'Học đủ';
+    } else if (b1Ok || b2Ok) {
+      return 'Nghỉ 1 buổi';
+    } else {
+      return 'Nghỉ';
+    }
+  } else {
+    // Lớp học 1 buổi/tuần
+    if (b1Ok || b2Ok) {
+      return 'Học đủ';
+    } else {
+      return 'Nghỉ';
+    }
+  }
+}
+
+function computeNote(g, giftedNote) {
+  const notes = [];
+  if (giftedNote) {
+    notes.push('🎁 ' + giftedNote);
+  }
+  if (g.b1 === STATUS_STUDENT_CANCEL && g.b1Date) {
+    notes.push('Nghỉ B1 (' + formatDayMonth(g.b1Date) + ')');
+  }
+  if (g.b2 === STATUS_STUDENT_CANCEL && g.b2Date) {
+    notes.push('Nghỉ B2 (' + formatDayMonth(g.b2Date) + ')');
+  }
+  return notes.join('; ');
+}
+
+function writeHeader(sheet) {
+  const headers = [
+    'Tuần', 'ID Học Sinh', 'Họ tên học sinh', 'Ngày bắt đầu học',
+    'Mã lớp', 'Giáo viên chủ nhiệm', 'Note HS', 'Đánh giá chung',
+    'Điểm BTVN buổi 1', 'Điểm BTVN buổi 2',
+    'Nhận xét chung (buổi 1 + 2 tuần này)', 'Mẫu đánh giá gửi phụ huynh',
+    'Trạng thái', 'PIC', 'Cập nhật lúc',
+  ];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold').setBackground('#e2ead9');
+  sheet.setFrozenRows(1);
+}
+
+function applyRowFormatting(sheet) {
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return;
+
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    const note = (r[6] || '').toString();
+    const attendanceStatus = (r[12] || '').toString(); // Cột M (index 12) chứa trạng thái điểm danh
+    let bgColor = null;
+    if (note.indexOf('🎁') >= 0) bgColor = '#FAEEDA';
+    else if (attendanceStatus === 'Nghỉ') bgColor = '#F1EFE8';
+
+    if (bgColor) {
+      sheet.getRange(i + 1, 1, 1, 15).setBackground(bgColor);
+    }
+  }
+}
+
+// ============================================================
+// READ for UI
+// ============================================================
+function findMonthlyFile(month, year) {
+  const cacheKey = 'monthly_file_' + month + '_' + year;
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    const parsed = JSON.parse(cached);
+    return parsed.found ? parsed : null;
+  }
+  const fileName = 'Nhận xét tháng ' + month + '/' + year;
+  const folder = DriveApp.getFolderById(CONFIG.NX_FOLDER_ID);
+  const files = folder.getFilesByName(fileName);
+  let result = null;
+  if (files.hasNext()) {
+    const f = files.next();
+    result = { id: f.getId(), name: fileName, url: f.getUrl(), found: true };
+  }
+  cache.put(cacheKey, JSON.stringify(result || { found: false }), 600);
+  return result;
+}
+
+// ============================================================
+// getWeeks: trả về tuần của tháng T VÀ T-1
+// THAY ĐỔI: merge tab từ 2 file; mỗi week có thêm trường fileId
+// ============================================================
+function getWeeks(month, year) {
+  const file = findMonthlyFile(month, year);
+  const prev = getPrevMonth(month, year);
+  const prevFile = findMonthlyFile(prev.month, prev.year);
+
+  if (!file && !prevFile) {
+    return { error: 'Chưa có file Nhận xét tháng ' + month + '/' + year };
+  }
+
+  function extractTabs(ss, fileId, refYear) {
+    return ss.getSheets()
+      .filter(function(s) {
+        const n = s.getName();
+        return !n.startsWith('_') && n !== 'Monthly';
+      })
+      .map(function(s) {
+        const name = s.getName();
+        const m = name.replace(/\s+/g, '').match(/(\d+)\/(\d+)-(\d+)\/(\d+)/);
+        if (!m) return null;
+        const day = parseInt(m[1]);
+        const mon = parseInt(m[2]);
+        const weekInMonth = Math.floor((day - 1) / 7) + 1;
+        return {
+          id: name,
+          fileId: fileId,
+          label: 'Tuần ' + weekInMonth + ' tháng ' + mon,
+          range: m[1] + '/' + m[2] + ' - ' + m[3] + '/' + m[4],
+          sortKey: (refYear * 10000) + (mon * 100) + day,
+        };
+      })
+      .filter(Boolean);
+  }
+
+  let tabs = [];
+  if (file)     tabs = tabs.concat(extractTabs(SpreadsheetApp.openById(file.id),     file.id,     year));
+  if (prevFile) tabs = tabs.concat(extractTabs(SpreadsheetApp.openById(prevFile.id), prevFile.id, prev.year));
+  tabs.sort(function(a, b) { return b.sortKey - a.sortKey; });
+
+  return {
+    weeks: tabs.map(function(t) {
+      return { id: t.id, fileId: t.fileId, label: t.label, range: t.range };
+    }),
+    file_url: (file || prevFile).url,
+    file_id:  (file || prevFile).id,
+  };
+}
+
+// ============================================================
+// getStudentsInWeek: không đổi signature
+// Frontend cần truyền đúng fileId của tuần được chọn (từ week.fileId)
+// ============================================================
+function getStudentsInWeek(monthlyFileId, tabName, login) {
+  const teacher = getTeacherByLogin(login);
+  if (!teacher) return { error: 'Tài khoản không tồn tại' };
+
+  const ss = SpreadsheetApp.openById(monthlyFileId);
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet) return { error: 'Không tìm thấy tab ' + tabName };
+
+  const schedules = loadClassSchedules();
+
+  const data = sheet.getDataRange().getValues();
+  const students = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (!row[1]) continue;
+    const rowTeacher = (row[5] || '').toString().toLowerCase();
+    // Chỉ hiển thị học sinh có cột F khớp với login GV đang đăng nhập
+    // Cột F đã được gán đúng từ aggregateWeekly theo GV chuyên môn dạy Buổi 2
+    if (rowTeacher !== teacher.login.toLowerCase()) continue;
+    students.push({
+      rowIndex: i + 1,
+      week: row[0],
+      student_id: row[1].toString(),
+      full_name: row[2],
+      start_date: row[3] instanceof Date ? Utilities.formatDate(row[3], 'GMT+7', 'dd/MM/yyyy') : row[3],
+      class_code: row[4],
+      teacher_login: rowTeacher,
+      note: row[6] || '',
+      status: row[7] || '',
+      score_b1: row[8],
+      score_b2: row[9],
+      feedback_text: row[10] || '',
+      is_gifted: (row[6] || '').toString().indexOf('🎁') >= 0,
+      is_absent: (row[12] || '').toString() === 'Nghỉ',
+      attendance_status: row[12] || '',
+      updated_at: row[14] ? (row[14] instanceof Date ? Utilities.formatDate(row[14], 'GMT+7', 'dd/MM/yyyy HH:mm') : row[14].toString()) : '',
+    });
+  }
+
+  // Tính deadlines dựa trên các lớp thực tế GV đang dạy trong tuần đó
+  const deadlines = {};
+  const now = new Date();
+  const year = now.getFullYear();
+  const classCodesInWeek = new Set(students.map(function(s) { return s.class_code; }));
+  classCodesInWeek.forEach(function(code) {
+    const sched = schedules[code];
+    if (!sched) return;
+    const dl = calcDeadline(tabName, sched, year);
+    if (dl) deadlines[code] = dl.getTime();
+  });
+
+  return { students: students, deadlines: deadlines, violations: getTeacherViolations(login) };
+}
+
+
+// ============================================================
+// WRITE feedback
+// ============================================================
+function saveFeedback(monthlyFileId, tabName, rowIndex, feedbackText, parentTemplate, login, scoreB1, scoreB2, statusEvaluation, studentId) {
+  const teacher = getTeacherByLogin(login);
+  if (!teacher) return { error: 'Tài khoản không tồn tại' };
+
+  const ss = SpreadsheetApp.openById(monthlyFileId);
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet) return { error: 'Không tìm thấy tab ' + tabName };
+
+  // Đọc B đến F (cột 2 đến 6) trong 1 lần gọi
+  let checkData = sheet.getRange(rowIndex, 2, 1, 5).getValues()[0];
+  let rowStudentId = (checkData[0] || '').toString();
+  let classInRow = (checkData[3] || '').toString();
+  let teacherInRow = (checkData[4] || '').toString().toLowerCase();
+
+  // Đảm bảo không ghi lệch dòng do có chèn/xóa dòng ở Sheets
+  if (studentId && rowStudentId !== studentId.toString()) {
+    const allStudentIds = sheet.getRange(1, 2, sheet.getLastRow(), 1).getValues();
+    let foundIndex = -1;
+    for (let i = 1; i < allStudentIds.length; i++) {
+      if (allStudentIds[i][0].toString() === studentId.toString()) {
+        foundIndex = i + 1;
+        break;
+      }
+    }
+    if (foundIndex === -1) {
+      return { error: 'Không tìm thấy học sinh với ID ' + studentId + ' trong tab ' + tabName };
+    }
+    rowIndex = foundIndex;
+    checkData = sheet.getRange(rowIndex, 2, 1, 5).getValues()[0];
+    rowStudentId = (checkData[0] || '').toString();
+    classInRow = (checkData[3] || '').toString();
+    teacherInRow = (checkData[4] || '').toString().toLowerCase();
+  }
+
+  // Kiểm tra quyền: chỉ GV ở cột F mới được ghi nhận xét
+  // Cột F đã được gán đúng từ aggregateWeekly theo GV chuyên môn dạy Buổi 2
+  const isOwner = teacherInRow === teacher.login.toLowerCase();
+  if (!isOwner) {
+    return { error: 'Bạn không có quyền sửa dòng này. Dòng này được phân công cho giáo viên khác.' };
+  }
+
+  const updatedAt = Utilities.formatDate(new Date(), 'GMT+7', 'dd/MM/yyyy HH:mm');
+  sheet.getRange(rowIndex, 8, 1, 5).setValues([[
+    statusEvaluation || '',
+    scoreB1 || '',
+    scoreB2 || '',
+    feedbackText,
+    parentTemplate || '',
+  ]]);
+  sheet.getRange(rowIndex, 15).setValue(updatedAt);
+  return { ok: true, updated_at: updatedAt };
+}
+
+// ============================================================
+// Lịch sử HS: lấy cả tháng T và T-1
+// THAY ĐỔI: không giới hạn 2 tháng cứng, dùng getPrevMonth đúng logic
+// ============================================================
+function getStudentHistory(studentId, currentMonth, currentYear, login) {
+  const teacher = getTeacherByLogin(login);
+  if (!teacher) return { error: 'Tài khoản không tồn tại' };
+
+  const prev = getPrevMonth(currentMonth, currentYear);
+  const months = [
+    { m: currentMonth, y: currentYear },
+    { m: prev.month,   y: prev.year   },
+  ];
+
+  const result = [];
+  for (let mi = 0; mi < months.length; mi++) {
+    const m = months[mi].m, y = months[mi].y;
+    const file = findMonthlyFile(m, y);
+    if (!file) continue;
+    const ss = SpreadsheetApp.openById(file.id);
+    const sheets = ss.getSheets().filter(function(s) {
+      return !s.getName().startsWith('_') && s.getName() !== 'Monthly';
+    });
+
+    for (let si = 0; si < sheets.length; si++) {
+      const sheet = sheets[si];
+      const data = sheet.getDataRange().getValues();
+      for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+        if (row[1] && row[1].toString() === studentId.toString() &&
+            (row[5] || '').toString().toLowerCase() === teacher.login.toLowerCase()) {
+          result.push({
+            tab:           sheet.getName(),
+            week:          row[0],
+            status:        row[7],
+            note:          row[6] || '',
+            score_b1:      row[8],
+            score_b2:      row[9],
+            feedback_text: row[10] || '',
+          });
+        }
+      }
+    }
+  }
+  return { history: result };
+}
+
+// ============================================================
+// AI gợi ý
+// ============================================================
+function getAiSuggestion(student) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY');
+  if (!apiKey) return { suggestion: mockSuggestion(student) };
+
+  const prompt = 'Bạn là giáo viên Toán đang viết nhận xét tuần cho phụ huynh học sinh Việt Nam.\n\n' +
+    'Học sinh: ' + student.full_name + '\n' +
+    'Lớp: ' + student.class_code + '\n' +
+    'Đánh giá chung: ' + (student.status || 'Học đủ') + '\n' +
+    'Note đặc biệt: ' + (student.note || 'không') + '\n' +
+    'Điểm BTVN buổi 1: ' + (student.score_b1 || 'chưa có') + '\n' +
+    'Điểm BTVN buổi 2: ' + (student.score_b2 || 'chưa có') + '\n\n' +
+    'Viết nhận xét theo cấu trúc 4 phần (mỗi phần 1-2 câu, cụ thể):\n' +
+    '- BTVN: nhận xét về việc làm bài tập về nhà\n' +
+    '- Kiến thức: nắm bài tuần này (để chỗ trống [GV điền] cho phần chuyên môn)\n' +
+    '- Kĩ năng: kỹ năng làm bài\n' +
+    '- Thái độ học tập: thái độ trong giờ\n\n' +
+    'Chỉ trả về nội dung nhận xét, không có lời mở đầu.';
+
+  try {
+    const response = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      payload: JSON.stringify({
+        model: 'claude-opus-4-7',
+        max_tokens: 500,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    const data = JSON.parse(response.getContentText());
+    return { suggestion: data.content[0].text };
+  } catch (e) {
+    return { suggestion: mockSuggestion(student), error: e.toString() };
+  }
+}
+
+function mockSuggestion(student) {
+  const s1 = parseFloat((student.score_b1 || '').toString().replace(',', '.'));
+  const s2 = parseFloat((student.score_b2 || '').toString().replace(',', '.'));
+  let btvn = '- BTVN: ';
+  if (isNaN(s1) && isNaN(s2)) btvn += 'Con chưa hoàn thành BTVN. Cô và gia đình cùng nhắc nhở con nhé.';
+  else if (s1 >= 8 && s2 >= 8) btvn += 'Con làm BTVN tốt (B1: ' + student.score_b1 + ', B2: ' + student.score_b2 + '). Cô khen con!';
+  else btvn += 'BTVN tuần này (B1: ' + student.score_b1 + ', B2: ' + student.score_b2 + '). Con cần đọc kĩ đề và tính toán cẩn thận hơn.';
+
+  return btvn + '\n- Kiến thức:\n+ Buổi 1: [GV điền nội dung cụ thể buổi 1]\n+ Buổi 2: [GV điền nội dung cụ thể buổi 2]\n- Kĩ năng: Con nắm được các bước cơ bản, cần luyện thêm tốc độ tính toán và trình bày.\n- Thái độ học tập: Trong giờ con tập trung, tương tác tốt với cô và các bạn.';
+}
+
+// ============================================================
+// DEADLINE
+// ============================================================
+function calcDeadline(weekRange, classSchedule, year) {
+  if (!classSchedule || classSchedule.day2_num === undefined) return null;
+  const m = weekRange.replace(/\s+/g, '').match(/(\d+)\/(\d+)-(\d+)\/(\d+)/);
+  if (!m) return null;
+  const startDay = parseInt(m[1]);
+  const startMonth = parseInt(m[2]);
+  const monday = new Date(year, startMonth - 1, startDay);
+  const offset = classSchedule.day2_num === 0 ? 6 : classSchedule.day2_num - 1;
+  const day2Date = new Date(monday);
+  day2Date.setDate(monday.getDate() + offset);
+  const deadline = new Date(day2Date);
+  deadline.setDate(day2Date.getDate() + 1);
+  deadline.setHours(DEADLINE_HOUR, DEADLINE_MINUTE, 0, 0);
+  return deadline;
+}
+
+function getDeadlinesForTeacher(login, weekRange, year) {
+  const teacher = getTeacherByLogin(login);
+  if (!teacher) return { error: 'Tài khoản không tồn tại' };
+
+  const schedules = loadClassSchedules();
+  const result = {};
+  for (const code in schedules) {
+    const s = schedules[code];
+    if (s.teacher_login.toLowerCase() !== teacher.login.toLowerCase()) continue;
+    const deadline = calcDeadline(weekRange, s, year);
+    if (deadline) {
+      result[code] = deadline.getTime();
+    }
+  }
+  return { deadlines: result, now: new Date().getTime() };
+}
+
+// ============================================================
+// CRON: gửi mail nhắc khi còn 12h tới deadline
+// ============================================================
+function cronCheckRemind12h() {
+  const now = new Date();
+  const month = now.getMonth() + 1;
+  const year = now.getFullYear();
+  const file = findMonthlyFile(month, year);
+  if (!file) return;
+
+  const ss = SpreadsheetApp.openById(file.id);
+  const schedules = loadClassSchedules();
+
+  const lichSS = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
+  const teachersData = lichSS.getSheetByName('_Teachers').getDataRange().getValues();
+  const teacherEmails = {};
+  for (let i = 1; i < teachersData.length; i++) {
+    const r = teachersData[i];
+    if (r[0]) teacherEmails[r[0].toString().toLowerCase()] = { email: r[2], name: r[3] };
+  }
+
+  const currentTabs = ss.getSheets().filter(s => {
+    const name = s.getName();
+    if (name.startsWith('_')) return false;
+    const m = name.replace(/\s+/g, '').match(/(\d+)\/(\d+)-(\d+)\/(\d+)/);
+    if (!m) return false;
+    const startDate = new Date(year, parseInt(m[2]) - 1, parseInt(m[1]));
+    const endDate = new Date(year, parseInt(m[4]) - 1, parseInt(m[3]));
+    endDate.setHours(23, 59, 59);
+    return now >= startDate && now <= endDate;
+  });
+  if (currentTabs.length === 0) return;
+
+  const sheet = currentTabs[0];
+  const tabName = sheet.getName();
+  const data = sheet.getDataRange().getValues();
+
+  const sentMap = getRemindedSet();
+  const newReminders = [];
+
+  const classMap = {};
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (!r[1]) continue;
+    if ((r[12] || '').toString() === 'Nghỉ') continue;
+    const classCode = r[4];
+    const teacherLogin = (r[5] || '').toString().toLowerCase();
+    const hasNote = (r[10] || '').toString().trim();
+    const key = teacherLogin + '|' + classCode;
+    if (!classMap[key]) classMap[key] = { teacher: teacherLogin, classCode: classCode, total: 0, done: 0 };
+    classMap[key].total++;
+    if (hasNote) classMap[key].done++;
+  }
+
+  for (const key in classMap) {
+    const cm = classMap[key];
+    if (cm.done >= cm.total) continue;
+
+    const sched = schedules[cm.classCode];
+    if (!sched) continue;
+    const deadline = calcDeadline(tabName, sched, year);
+    if (!deadline) continue;
+
+    const msToDeadline = deadline.getTime() - now.getTime();
+    const hoursLeft = msToDeadline / (1000 * 60 * 60);
+    if (hoursLeft < 11 || hoursLeft > 12) continue;
+
+    const sentKey = tabName + '|' + cm.classCode + '|' + cm.teacher;
+    if (sentMap[sentKey]) continue;
+
+    const teacherInfo = teacherEmails[cm.teacher];
+    if (!teacherInfo || !teacherInfo.email) continue;
+
+    MailApp.sendEmail({
+      to: teacherInfo.email,
+      subject: '⏰ [Sổ Nhận Xét] Còn 12h để nhận xét lớp ' + cm.classCode,
+      htmlBody:
+        '<p>Xin chào <strong>' + (teacherInfo.name || cm.teacher) + '</strong>,</p>' +
+        '<p>Bạn còn <strong>khoảng 12 giờ</strong> để hoàn thành nhận xét cho lớp:</p>' +
+        '<ul><li><strong>' + cm.classCode + '</strong> — đã NX ' + cm.done + '/' + cm.total + ' HS</li></ul>' +
+        '<p>Deadline: <strong>' + Utilities.formatDate(deadline, TIMEZONE, 'HH:mm dd/MM/yyyy') + '</strong></p>' +
+        '<p>Vui lòng vào Sổ Nhận Xét: <a href="' + ScriptApp.getService().getUrl() + '">Mở app</a></p>',
+    });
+    newReminders.push(sentKey);
+    Logger.log('Đã gửi nhắc 12h: ' + cm.teacher + ' - ' + cm.classCode);
+  }
+
+  saveRemindedSet(sentMap, newReminders);
+}
+
+function getRemindedSet() {
+  const raw = PropertiesService.getScriptProperties().getProperty('REMINDED_12H');
+  return raw ? JSON.parse(raw) : {};
+}
+
+function saveRemindedSet(existing, newKeys) {
+  newKeys.forEach(k => existing[k] = new Date().getTime());
+  const now = new Date().getTime();
+  const monthMs = 30 * 24 * 60 * 60 * 1000;
+  for (const k in existing) {
+    if (now - existing[k] > monthMs) delete existing[k];
+  }
+  PropertiesService.getScriptProperties().setProperty('REMINDED_12H', JSON.stringify(existing));
+}
+
+// ============================================================
+// CRON: ghi danh sách vi phạm sau deadline
+// ============================================================
+function cronRecordViolations() {
+  const now = new Date();
+  const month = now.getMonth() + 1;
+  const year = now.getFullYear();
+  const file = findMonthlyFile(month, year);
+  if (!file) return;
+
+  const ss = SpreadsheetApp.openById(file.id);
+  const schedules = loadClassSchedules();
+
+  const currentTabs = ss.getSheets().filter(s => {
+    const name = s.getName();
+    if (name.startsWith('_')) return false;
+    const m = name.replace(/\s+/g, '').match(/(\d+)\/(\d+)-(\d+)\/(\d+)/);
+    if (!m) return false;
+    const startDate = new Date(year, parseInt(m[2]) - 1, parseInt(m[1]));
+    const endDate = new Date(year, parseInt(m[4]) - 1, parseInt(m[3]));
+    endDate.setHours(23, 59, 59);
+    return now >= startDate && now <= endDate;
+  });
+  if (currentTabs.length === 0) return;
+
+  const sheet = currentTabs[0];
+  const tabName = sheet.getName();
+  const data = sheet.getDataRange().getValues();
+
+  const violationsSent = getViolationsSet();
+  const warningsSent = getOverdueWarningsSet();
+  const newViolations = [];
+  const newWarnings = [];
+
+  const classMap = {};
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (!r[1]) continue;
+    if ((r[12] || '').toString() === 'Nghỉ') continue;
+    const classCode = r[4];
+    const teacherLogin = (r[5] || '').toString().toLowerCase();
+    const hasNote = (r[10] || '').toString().trim();
+    const key = teacherLogin + '|' + classCode;
+    if (!classMap[key]) classMap[key] = { teacher: teacherLogin, classCode: classCode, total: 0, done: 0 };
+    classMap[key].total++;
+    if (hasNote) classMap[key].done++;
+  }
+
+  const violationRows = [];
+  const warningRows = [];
+
+  for (const key in classMap) {
+    const cm = classMap[key];
+    const sched = schedules[cm.classCode];
+    if (!sched) continue;
+    const deadline = calcDeadline(tabName, sched, year);
+    if (!deadline) continue;
+
+    if (now.getTime() < deadline.getTime()) continue;
+
+    const violKey = tabName + '|' + cm.classCode + '|' + cm.teacher;
+
+    if (cm.done === 0) {
+      if (violationsSent[violKey]) continue;
+      const reason = 'Quá deadline ' + Utilities.formatDate(deadline, TIMEZONE, 'HH:mm dd/MM') + ' chưa nhận xét HS nào';
+      violationRows.push({
+        classCode: cm.classCode,
+        teacher: cm.teacher,
+        reason: reason,
+        key: violKey,
+        week: tabName,
+        time: now,
+      });
+    } else if (cm.done < cm.total) {
+      if (warningsSent[violKey] || violationsSent[violKey]) continue;
+      const reason = 'Quá deadline ' + Utilities.formatDate(deadline, TIMEZONE, 'HH:mm dd/MM') + ' mới NX ' + cm.done + '/' + cm.total + ' HS';
+      warningRows.push({
+        classCode: cm.classCode,
+        teacher: cm.teacher,
+        reason: reason,
+        key: violKey,
+        week: tabName,
+        time: now,
+      });
+    }
+  }
+
+  if (violationRows.length > 0) {
+    const violSS = SpreadsheetApp.openById(CONFIG.VIOLATION_SHEET_ID);
+    let violSheet = violSS.getSheetByName('Danh sách vi phạm');
+    if (!violSheet) {
+      violSheet = violSS.insertSheet('Danh sách vi phạm');
+      violSheet.getRange(1, 1, 1, 5).setValues([['STT', 'Mã lớp', 'Code GV', 'Lý do phạt', 'Thời gian ghi nhận']]);
+      violSheet.getRange(1, 1, 1, 5).setFontWeight('bold').setBackground('#e2ead9');
+      violSheet.setFrozenRows(1);
+    }
+
+    const lastRow = violSheet.getLastRow();
+    const startStt = lastRow;
+
+    const newRows = violationRows.map((v, idx) => [
+      startStt + idx,
+      v.classCode,
+      v.teacher,
+      v.reason,
+      Utilities.formatDate(v.time, TIMEZONE, 'HH:mm dd/MM/yyyy'),
+    ]);
+
+    violSheet.getRange(lastRow + 1, 1, newRows.length, 5).setValues(newRows);
+
+    violationRows.forEach(v => newViolations.push(v.key));
+    saveViolationsSet(violationsSent, newViolations);
+
+    // Gửi mail tổng hợp cho Admin
+    MailApp.sendEmail({
+      to: CONFIG.ADMIN_EMAIL,
+      subject: '[Sổ Nhận Xét] ' + violationRows.length + ' GV vi phạm deadline nhận xét tuần ' + tabName,
+      htmlBody:
+        '<p>Hệ thống đã ghi nhận ' + violationRows.length + ' lớp vi phạm (chưa nhận xét học sinh nào):</p>' +
+        '<ul>' + violationRows.map(v => '<li><strong>' + v.classCode + '</strong> (GV: ' + v.teacher + ') — ' + v.reason + '</li>').join('') + '</ul>' +
+        '<p>Xem chi tiết: <a href="' + violSS.getUrl() + '">' + violSS.getUrl() + '</a></p>',
+    });
+  }
+
+  const lichSS = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
+  const teachersData = lichSS.getSheetByName('_Teachers').getDataRange().getValues();
+  const teacherEmailMap = {};
+  for (let i = 1; i < teachersData.length; i++) {
+    const r = teachersData[i];
+    if (r[0]) teacherEmailMap[r[0].toString().toLowerCase()] = { email: r[2] || '', name: r[3] || r[0] };
+  }
+
+  // Gửi mail vi phạm cho GV (done === 0)
+  const byTeacherViol = {};
+  violationRows.forEach(function(v) {
+    const login = v.teacher.toLowerCase();
+    if (!byTeacherViol[login]) byTeacherViol[login] = [];
+    byTeacherViol[login].push(v);
+  });
+
+  for (const login in byTeacherViol) {
+    const info = teacherEmailMap[login];
+    if (!info || !info.email) {
+      Logger.log('Không tìm thấy email GV vi phạm: ' + login);
+      continue;
+    }
+    const violations = byTeacherViol[login];
+    MailApp.sendEmail({
+      to: info.email,
+      subject: '⚠️ [Sổ Nhận Xét] Bạn đã quá hạn nhận xét tuần ' + tabName,
+      htmlBody:
+        '<p>Xin chào <strong>' + info.name + '</strong>,</p>' +
+        '<p>Hệ thống ghi nhận bạn đã <strong>quá deadline</strong> nhận xét tuần <strong>' + tabName + '</strong> cho các lớp sau:</p>' +
+        '<ul>' + violations.map(function(v) {
+          return '<li><strong>' + v.classCode + '</strong> — ' + v.reason + '</li>';
+        }).join('') + '</ul>' +
+        '<p>Vi phạm này đã được ghi vào hệ thống. Vui lòng vào app hoàn thành ngay:</p>' +
+        '<p><a href="' + ScriptApp.getService().getUrl() + '">👉 Mở Sổ Nhận Xét</a></p>' +
+        '<p><em>Nếu bạn nghĩ đây là nhầm lẫn, hãy liên hệ Admin.</em></p>',
+    });
+    Logger.log('Đã gửi mail vi phạm tuần tới GV: ' + info.email);
+  }
+
+  // Gửi mail cảnh báo quá hạn cho GV (0 < done < total)
+  const byTeacherWarn = {};
+  warningRows.forEach(function(w) {
+    const login = w.teacher.toLowerCase();
+    if (!byTeacherWarn[login]) byTeacherWarn[login] = [];
+    byTeacherWarn[login].push(w);
+  });
+
+  for (const login in byTeacherWarn) {
+    const info = teacherEmailMap[login];
+    if (!info || !info.email) {
+      Logger.log('Không tìm thấy email GV cảnh báo: ' + login);
+      continue;
+    }
+    const warnings = byTeacherWarn[login];
+    MailApp.sendEmail({
+      to: info.email,
+      subject: '⏰ [Sổ Nhận Xét] Cảnh báo quá hạn nhận xét tuần ' + tabName,
+      htmlBody:
+        '<p>Xin chào <strong>' + info.name + '</strong>,</p>' +
+        '<p>Hệ thống ghi nhận bạn đã <strong>quá deadline</strong> nhận xét tuần <strong>' + tabName + '</strong> nhưng chưa hoàn thành đủ 100% học sinh:</p>' +
+        '<ul>' + warnings.map(function(w) {
+          return '<li><strong>' + w.classCode + '</strong> — ' + w.reason + '</li>';
+        }).join('') + '</ul>' +
+        '<p>Trường hợp này chưa bị ghi nhận phạt lỗi vi phạm, vui lòng hoàn thành bổ sung sớm nhất có thể:</p>' +
+        '<p><a href="' + ScriptApp.getService().getUrl() + '">👉 Mở Sổ Nhận Xét</a></p>',
+    });
+    Logger.log('Đã gửi mail cảnh báo quá hạn tuần tới GV: ' + info.email);
+  }
+
+  warningRows.forEach(w => newWarnings.push(w.key));
+  if (newWarnings.length > 0) {
+    saveOverdueWarningsSet(warningsSent, newWarnings);
+  }
+
+  Logger.log('Đã ghi nhận xong: ' + violationRows.length + ' vi phạm tuần và gửi ' + warningRows.length + ' cảnh báo trễ hạn.');
+}
+
+function getOverdueWarningsSet() {
+  const raw = PropertiesService.getScriptProperties().getProperty('OVERDUE_WARNINGS_SENT');
+  return raw ? JSON.parse(raw) : {};
+}
+
+function saveOverdueWarningsSet(existing, newKeys) {
+  newKeys.forEach(k => existing[k] = new Date().getTime());
+  const now = new Date().getTime();
+  const monthMs = 30 * 24 * 60 * 60 * 1000;
+  for (const k in existing) {
+    if (now - existing[k] > monthMs) delete existing[k];
+  }
+  PropertiesService.getScriptProperties().setProperty('OVERDUE_WARNINGS_SENT', JSON.stringify(existing));
+}
+
+function getViolationsSet() {
+  const raw = PropertiesService.getScriptProperties().getProperty('VIOLATIONS_RECORDED');
+  return raw ? JSON.parse(raw) : {};
+}
+
+function getTeacherViolations(login) {
+  if (!login) return [];
+  const violationsRecorded = getViolationsSet();
+  const teacherViolations = [];
+  for (const key in violationsRecorded) {
+    const parts = key.split('|');
+    if (parts.length === 3 && parts[2].toLowerCase() === login.toLowerCase()) {
+      teacherViolations.push({
+        week: parts[0],
+        classCode: parts[1],
+        key: key
+      });
+    }
+  }
+  return teacherViolations;
+}
+
+function saveViolationsSet(existing, newKeys) {
+  newKeys.forEach(k => existing[k] = new Date().getTime());
+  const now = new Date().getTime();
+  const monthMs = 30 * 24 * 60 * 60 * 1000;
+  for (const k in existing) {
+    if (now - existing[k] > monthMs) delete existing[k];
+  }
+  PropertiesService.getScriptProperties().setProperty('VIOLATIONS_RECORDED', JSON.stringify(existing));
+}
+
+// ============================================================
+// IMPORT TỪ LMS
+// ============================================================
+function importFromLMS() {
+  const stats = {
+    sourceRows: 0,
+    transformed: 0,
+    skippedNoStudent: 0,
+    skippedDuplicate: 0,
+    updated: 0,
+    appended: 0,
+    error: null,
+  };
+
+  try {
+    const lmsSS = SpreadsheetApp.openById(CONFIG.LMS_EXPORT_SHEET_ID);
+    const lmsSheet = lmsSS.getSheetByName(CONFIG.LMS_EXPORT_TAB_NAME);
+    if (!lmsSheet) {
+      throw new Error('Không tìm thấy tab "' + CONFIG.LMS_EXPORT_TAB_NAME + '" trong file LMS. Kiểm tra LMS_EXPORT_TAB_NAME trong CONFIG.');
+    }
+    const lmsData = lmsSheet.getDataRange().getValues();
+    stats.sourceRows = lmsData.length - 1;
+
+    if (lmsData.length < 2) {
+      stats.error = 'File LMS rỗng (không có data)';
+      return stats;
+    }
+
+    const mainSS = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
+    let dailySheet = mainSS.getSheetByName('_DailySessions');
+    if (!dailySheet) {
+      dailySheet = mainSS.insertSheet('_DailySessions');
+      dailySheet.getRange(1, 1, 1, 6).setValues([['date', 'student_id', 'full_name', 'class_code', 'status', 'specialist_teacher']]);
+      dailySheet.getRange(1, 1, 1, 6).setFontWeight('bold').setBackground('#e2ead9');
+      dailySheet.setFrozenRows(1);
+      dailySheet.hideSheet();
+    } else {
+      // Nâng cấp header cũ nếu thiếu cột specialist_teacher
+      const currentHeaders = dailySheet.getRange(1, 1, 1, dailySheet.getLastColumn()).getValues()[0];
+      if (currentHeaders.indexOf('specialist_teacher') === -1) {
+        dailySheet.getRange(1, 6).setValue('specialist_teacher');
+        dailySheet.getRange(1, 6).setFontWeight('bold').setBackground('#e2ead9');
+      }
+    }
+
+    const existingData = dailySheet.getDataRange().getValues();
+    const existingKeys = {};
+    for (let i = 1; i < existingData.length; i++) {
+      const r = existingData[i];
+      const dateStr = r[0] instanceof Date
+        ? Utilities.formatDate(r[0], 'GMT+7', 'dd/MM/yyyy')
+        : (r[0] || '').toString();
+      const key = dateStr + '|' + (r[1] || '').toString() + '|' + (r[3] || '').toString();
+      existingKeys[key] = {
+        arrayIndex: i,
+        status: (r[4] || '').toString().trim(),
+        specialist_teacher: (r[5] || '').toString().trim()
+      };
+    }
+
+    const newRows = [];
+    let hasUpdates = false;
+    for (let i = 1; i < lmsData.length; i++) {
+      const r = lmsData[i];
+      const rawDate = r[0];
+      const dateStr = rawDate instanceof Date
+        ? Utilities.formatDate(rawDate, 'GMT+7', 'dd/MM/yyyy')
+        : (rawDate || '').toString().trim();
+      const studentId = (r[12] || '').toString().trim();
+      const fullName = (r[11] || '').toString().trim();
+      const classCode = (r[2] || '').toString().trim();
+      const status = (r[20] || '').toString().trim();
+      // Cột 10 trong LMS export = "Giáo viên chuyên môn" (login GV thực tế dạy buổi đó)
+      const specialistTeacher = (r[10] || '').toString().trim().toLowerCase();
+
+      if (!studentId || !classCode || !dateStr) {
+        stats.skippedNoStudent++;
+        continue;
+      }
+      stats.transformed++;
+
+      const key = dateStr + '|' + studentId + '|' + classCode;
+      if (existingKeys[key]) {
+        const existInfo = existingKeys[key];
+        let rowChanged = false;
+        if (existInfo.status !== status) {
+          existingData[existInfo.arrayIndex][4] = status;
+          existInfo.status = status;
+          rowChanged = true;
+        }
+        // Cập nhật specialist_teacher nếu có và chưa đúng
+        if (specialistTeacher && existInfo.specialist_teacher !== specialistTeacher) {
+          existingData[existInfo.arrayIndex][5] = specialistTeacher;
+          existInfo.specialist_teacher = specialistTeacher;
+          rowChanged = true;
+        }
+        if (rowChanged) {
+          stats.updated++;
+          hasUpdates = true;
+        } else {
+          stats.skippedDuplicate++;
+        }
+        continue;
+      }
+
+      newRows.push([dateStr, studentId, fullName, classCode, status, specialistTeacher]);
+      existingKeys[key] = {
+        arrayIndex: existingData.length + newRows.length - 1,
+        status: status,
+        specialist_teacher: specialistTeacher
+      };
+    }
+
+    if (hasUpdates) {
+      // Cập nhật cả cột status (5) và specialist_teacher (6)
+      const updateValues = [];
+      for (let i = 1; i < existingData.length; i++) {
+        updateValues.push([existingData[i][4], existingData[i][5] || '']);
+      }
+      dailySheet.getRange(2, 5, updateValues.length, 2).setValues(updateValues);
+    }
+
+    if (newRows.length > 0) {
+      const startRow = dailySheet.getLastRow() + 1;
+      dailySheet.getRange(startRow, 1, newRows.length, newRows[0].length).setValues(newRows);
+      stats.appended = newRows.length;
+    }
+  } catch (e) {
+    stats.error = e.toString();
+  }
+
+  Logger.log('importFromLMS: ' + JSON.stringify(stats));
+  return stats;
+}
+
+function cronImportAndAggregate() {
+  let importStats = null;
+  let aggregateStats = null;
+  let errors = [];
+
+  try {
+    importStats = importFromLMS();
+    if (importStats.error) errors.push('Import: ' + importStats.error);
+  } catch (e) {
+    errors.push('Import exception: ' + e.toString());
+  }
+
+  try {
+    aggregateStats = aggregateWeekly();
+  } catch (e) {
+    errors.push('Aggregate exception: ' + e.toString());
+  }
+
+  Logger.log('cronImportAndAggregate: import=' + JSON.stringify(importStats) +
+             ' aggregate=' + JSON.stringify(aggregateStats));
+
+  if (errors.length > 0 || (importStats && (importStats.appended > 0 || importStats.updated > 0))) {
+    let body = '<p>Báo cáo import sáng nay (' +
+               Utilities.formatDate(new Date(), 'GMT+7', 'dd/MM/yyyy HH:mm') + '):</p>';
+    if (importStats) {
+      body += '<ul>' +
+              '<li>Tổng dòng LMS export: ' + importStats.sourceRows + '</li>' +
+              '<li>Đã append vào _DailySessions: <strong>' + importStats.appended + '</strong> dòng mới</li>' +
+              '<li>Đã cập nhật trạng thái học tập mới: <strong>' + importStats.updated + '</strong> dòng cũ</li>' +
+              '<li>Skip duplicate (không thay đổi trạng thái): ' + importStats.skippedDuplicate + '</li>' +
+              '<li>Skip thiếu data: ' + importStats.skippedNoStudent + '</li>' +
+              '</ul>';
+    }
+    if (aggregateStats) {
+      body += '<p>Aggregate: ghi <strong>' + (aggregateStats.totalWritten || 0) + '</strong> rows vào file NX</p>';
+    }
+    if (errors.length > 0) {
+      body += '<p style="color:red"><strong>Lỗi:</strong></p><ul>' +
+              errors.map(function(e) { return '<li>' + e + '</li>'; }).join('') + '</ul>';
+    }
+    MailApp.sendEmail({
+      to: CONFIG.ADMIN_EMAIL,
+      subject: '[Sổ Nhận Xét] Báo cáo import LMS ' +
+               Utilities.formatDate(new Date(), 'GMT+7', 'dd/MM'),
+      htmlBody: body,
+    });
+  }
+
+  return { importStats: importStats, aggregateStats: aggregateStats, errors: errors };
+}
+
+function onOpen(e) {
+  SpreadsheetApp.getUi()
+    .createMenu('📥 Sổ Nhận Xét')
+    .addItem('Import data LMS → _DailySessions', 'menuImportFromLMS')
+    .addItem('Tổng hợp lại từ _DailySessions', 'menuAggregate')
+    .addItem('Chạy cả import + aggregate', 'menuFullPipeline')
+    .addSeparator()
+    .addItem('📋 Tạo danh sách báo cáo tháng hiện tại', 'menuBuildMonthly')
+    .addSeparator()
+    .addItem('Dọn dẹp dữ liệu cột G, H, I, J bị sai', 'cleanupWrongScores')
+    .addItem('Cleanup tab trắng trong file NX', 'cleanupBlankTabs')
+    .addSeparator()
+    .addItem('Kiểm tra lỗi cột PIC tuần', 'debugPicColumn')
+    .addToUi();
+}
+
+function menuBuildMonthly() {
+  const ui = SpreadsheetApp.getUi();
+  const now = new Date();
+  const month = now.getMonth() + 1;
+  const year = now.getFullYear();
+  const result = ui.alert(
+    'Tạo danh sách báo cáo tháng ' + month + '/' + year,
+    'Tổng hợp danh sách HS active (có ngày bắt đầu < 15/' + month + ') để GV viết báo cáo. Tiếp tục?',
+    ui.ButtonSet.YES_NO
+  );
+  if (result !== ui.Button.YES) return;
+  try {
+    const r = buildMonthlyReportList(month, year);
+    ui.alert('✅ Hoàn tất', 'Tổng: ' + r.total + ' HS\nMới thêm: ' + r.newAdded + ' HS', ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('❌ Lỗi', e.toString(), ui.ButtonSet.OK);
+  }
+}
+
+function menuImportFromLMS() {
+  const ui = SpreadsheetApp.getUi();
+  ui.alert('Đang import từ LMS, vui lòng đợi 10-30 giây...');
+  const stats = importFromLMS();
+  if (stats.error) {
+    ui.alert('❌ Lỗi import', stats.error, ui.ButtonSet.OK);
+    return;
+  }
+  ui.alert(
+    '✅ Import xong',
+    'Tổng LMS: ' + stats.sourceRows + ' dòng\n' +
+    'Đã thêm mới (append): ' + stats.appended + ' dòng\n' +
+    'Đã cập nhật trạng thái học tập mới: ' + stats.updated + ' dòng\n' +
+    'Trùng lặp / giữ nguyên (skip): ' + stats.skippedDuplicate + '\n' +
+    'Thiếu data (skip): ' + stats.skippedNoStudent,
+    ui.ButtonSet.OK
+  );
+}
+
+function menuAggregate() {
+  let ui = null;
+  try { ui = SpreadsheetApp.getUi(); } catch(e) {}
+  if (ui) ui.alert('Đang tổng hợp dữ liệu sang file NX tháng, vui lòng đợi...');
+  try {
+    const result = aggregateWeekly();
+    const msg = 'Đã ghi ' + (result.totalWritten || 0) + ' rows mới';
+    Logger.log('✅ Hoàn tất: ' + msg);
+    if (ui) ui.alert('✅ Hoàn tất', msg, ui.ButtonSet.OK);
+  } catch (e) {
+    Logger.log('❌ Lỗi menuAggregate: ' + e.toString());
+    if (ui) ui.alert('❌ Lỗi', e.toString(), ui.ButtonSet.OK);
+  }
+}
+
+function menuFullPipeline() {
+  let ui = null;
+  try { ui = SpreadsheetApp.getUi(); } catch(e) {}
+  if (ui) ui.alert('Đang chạy: Import LMS → Aggregate. Vui lòng đợi 30-60 giây...');
+  try {
+    const result = cronImportAndAggregate();
+    let msg = '';
+    if (result.importStats) {
+      msg += 'Import: ' + result.importStats.appended + ' rows mới, cập nhật trạng thái: ' + result.importStats.updated + ' (skip dup: ' + result.importStats.skippedDuplicate + ')\n';
+    }
+    if (result.aggregateStats) {
+      msg += 'Aggregate: ' + (result.aggregateStats.totalWritten || 0) + ' rows vào file NX\n';
+    }
+    if (result.errors && result.errors.length > 0) {
+      msg += '\n⚠ Lỗi:\n' + result.errors.join('\n');
+    }
+    Logger.log('✅ Hoàn tất pipeline: ' + msg);
+    if (ui) ui.alert('✅ Hoàn tất', msg, ui.ButtonSet.OK);
+  } catch (e) {
+    Logger.log('❌ Lỗi menuFullPipeline: ' + e.toString());
+    if (ui) ui.alert('❌ Lỗi', e.toString(), ui.ButtonSet.OK);
+  }
+}
+
+// ============================================================
+// Helper: tìm GV chuyên môn dạy lớp đó trong 7 ngày cuối của tháng
+// Logic: quét _DailySessions, lấy GV dạy Buổi 2 trong [ngày cuối-6 .. ngày cuối]
+// Nếu không có Buổi 2, fallback Buổi 1, fallback lịch mặc định (sched.teacher_login)
+// ============================================================
+function getMonthlyReportTeacher(dailyData, classNorm, month, year, schedTeacherLogin) {
+  const lastDay = new Date(year, month, 0);
+  const windowStart = new Date(year, month - 1, lastDay.getDate() - 6);
+
+  let latestInWindow = null;
+  let latestInMonth = null;
+
+  for (let i = 1; i < dailyData.length; i++) {
+    const r = dailyData[i];
+    const date = parseVNDate(r[0]);
+    if (!date) continue;
+    
+    // Lọc theo tháng và năm báo cáo
+    if (date.getMonth() + 1 !== month || date.getFullYear() !== year) continue;
+
+    const classCodeRaw = (r[3] || '').toString();
+    if (normalizeClassCode(classCodeRaw) !== classNorm) continue;
+
+    const specialistTeacher = (r[5] || '').toString().trim().toLowerCase();
+    if (!specialistTeacher) continue;
+
+    const time = date.getTime();
+    
+    // Lưu buổi muộn nhất trong cả tháng
+    if (!latestInMonth || time > latestInMonth.time) {
+      latestInMonth = { teacher: specialistTeacher, time: time };
+    }
+
+    // Lưu buổi muộn nhất trong 7 ngày cuối tháng
+    if (date >= windowStart && date <= lastDay) {
+      if (!latestInWindow || time > latestInWindow.time) {
+        latestInWindow = { teacher: specialistTeacher, time: time };
+      }
+    }
+  }
+
+  if (latestInWindow) {
+    return latestInWindow.teacher;
+  }
+  if (latestInMonth) {
+    return latestInMonth.teacher;
+  }
+  return schedTeacherLogin;
+}
+
+function buildMonthlyReportList(month, year) {
+  const lichSS = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
+  const dailySheet = lichSS.getSheetByName('_DailySessions');
+  if (!dailySheet) throw new Error('Chưa có tab _DailySessions');
+
+  const dailyData = dailySheet.getDataRange().getValues();
+  const schedules = loadClassSchedules();
+
+  const studentMap = {};
+  for (let i = 1; i < dailyData.length; i++) {
+    const r = dailyData[i];
+    const date = parseVNDate(r[0]);
+    if (!date) continue;
+    if (date.getMonth() + 1 !== month || date.getFullYear() !== year) continue;
+    const studentId = (r[1] || '').toString();
+    const fullName = r[2] || '';
+    const classCodeRaw = r[3] || '';
+    if (!studentId || !classCodeRaw) continue;
+
+    const classNorm = normalizeClassCode(classCodeRaw);
+    const sched = schedules[classNorm];
+    if (!sched) continue;
+
+    const key = studentId + '|' + classNorm;
+    if (!studentMap[key]) {
+      studentMap[key] = {
+        studentId: studentId, fullName: fullName,
+        classCode: classNorm,
+        // GV báo cáo tháng = GV chuyên môn dạy trong 7 ngày cuối tháng
+        teacherLogin: getMonthlyReportTeacher(dailyData, classNorm, month, year, sched.teacher_login),
+        pic: sched.pic || '',
+        earliestDate: date,
+      };
+    } else if (date < studentMap[key].earliestDate) {
+      studentMap[key].earliestDate = date;
+    }
+  }
+
+  const cutoff = new Date(year, month - 1, 15);
+  const filtered = [];
+  for (const k in studentMap) {
+    if (studentMap[k].earliestDate < cutoff) {
+      filtered.push(studentMap[k]);
+    }
+  }
+
+  let file = findMonthlyFile(month, year);
+  if (!file) file = createMonthlyFile(month, year);
+
+  const fileSS = SpreadsheetApp.openById(file.id);
+  let tab = fileSS.getSheetByName('Monthly');
+  if (!tab) {
+    tab = fileSS.insertSheet('Monthly');
+    tab.getRange(1, 1, 1, MONTHLY_HEADERS.length).setValues([MONTHLY_HEADERS]);
+    tab.getRange(1, 1, 1, MONTHLY_HEADERS.length).setFontWeight('bold').setBackground('#e2ead9');
+    tab.setFrozenRows(1);
+  } else {
+    // Tự động nâng cấp tiêu đề bảng cũ để bổ sung cột 'PIC' nếu chưa có
+    const currentHeaders = tab.getRange(1, 1, 1, tab.getLastColumn()).getValues()[0];
+    if (currentHeaders.indexOf('PIC') === -1) {
+      tab.getRange(1, 1, 1, MONTHLY_HEADERS.length).setValues([MONTHLY_HEADERS]);
+      tab.getRange(1, 1, 1, MONTHLY_HEADERS.length).setFontWeight('bold').setBackground('#e2ead9');
+    }
+  }
+
+  const existing = tab.getDataRange().getValues();
+  const existingKeys = {};
+  for (let i = 1; i < existing.length; i++) {
+    const r = existing[i];
+    if (r[0] && r[2]) existingKeys[r[0].toString() + '|' + r[2].toString()] = i + 1;
+  }
+
+  const newRows = [];
+  const updates = [];
+  for (let i = 0; i < filtered.length; i++) {
+    const s = filtered[i];
+    const k = s.studentId + '|' + s.classCode;
+    if (existingKeys[k]) {
+      // Cập nhật lại GV (có thể đã thay trong 7 ngày cuối) và PIC
+      updates.push({
+        rowIndex: existingKeys[k],
+        teacherLogin: s.teacherLogin,
+        pic: s.pic
+      });
+      continue;
+    }
+    newRows.push([
+      s.studentId, s.fullName, s.classCode,
+      Utilities.formatDate(s.earliestDate, 'GMT+7', 'dd/MM/yyyy'),
+      s.teacherLogin,
+      '', '', '', '', '', '', '', '', '', '', '',
+      s.pic,
+    ]);
+  }
+
+  if (newRows.length > 0) {
+    tab.getRange(tab.getLastRow() + 1, 1, newRows.length, newRows[0].length).setValues(newRows);
+  }
+  if (updates.length > 0) {
+    updates.forEach(u => {
+      tab.getRange(u.rowIndex, 5).setValue(u.teacherLogin); // Cột E (GV chủ nhiệm)
+      tab.getRange(u.rowIndex, 17).setValue(u.pic);         // Cột Q (PIC)
+    });
+  }
+
+  return { ok: true, total: filtered.length, newAdded: newRows.length };
+}
+
+// ============================================================
+// getMonthlyStudents: trả về HS báo cáo tháng T VÀ T-1
+// THAY ĐỔI: merge students từ 2 tháng, mỗi student có thêm
+//           fileId, month, year, monthLabel để frontend dùng đúng
+// ============================================================
+function getMonthlyStudents(login, month, year) {
+  const teacher = getTeacherByLogin(login);
+  if (!teacher) return { error: 'Tài khoản không tồn tại' };
+
+  const prev = getPrevMonth(month, year);
+  const schedules = loadClassSchedules();
+  const myClassCodes = new Set(
+    Object.values(schedules)
+      .filter(function(c) { return c.teacher_login.toLowerCase() === teacher.login.toLowerCase(); })
+      .map(function(c) { return c.class_code; })
+  );
+
+  function readFromFile(m, y) {
+    const file = findMonthlyFile(m, y);
+    if (!file) return [];
+
+    const ss = SpreadsheetApp.openById(file.id);
+    let tab = ss.getSheetByName('Monthly');
+    if (!tab) {
+      try { buildMonthlyReportList(m, y); tab = ss.getSheetByName('Monthly'); }
+      catch (e) { return []; }
+    }
+    if (!tab) return [];
+
+    const data = tab.getDataRange().getValues();
+    const students = [];
+    const rowsToUpdateTeacher = [];
+
+    for (let i = 1; i < data.length; i++) {
+      const r = data[i];
+      if (!r[0]) continue;
+
+      const rowTeacher = (r[4] || '').toString().toLowerCase();
+      const rowClass = (r[2] || '').toString();
+
+      // Chỉ hiển thị HS có cột E (GV chủ nhiệm) khớp login GV đang đăng nhập
+      // Cột E đã được gán từ buildMonthlyReportList theo GV dạy 7 ngày cuối tháng
+      if (rowTeacher !== teacher.login.toLowerCase()) continue;
+
+      const isDone = !!(r[6] || r[8] || r[10]);
+      students.push({
+        rowIndex:      i + 1,
+        fileId:        file.id,
+        fileUrl:       file.url,
+        month:         m,
+        year:          y,
+        monthLabel:    'Tháng ' + m + '/' + y,
+        student_id:    r[0].toString(),
+        full_name:     r[1],
+        class_code:    rowClass,
+        start_date:    r[3] instanceof Date
+          ? Utilities.formatDate(r[3], 'GMT+7', 'dd/MM/yyyy') : r[3],
+        teacher_login: rowTeacher,
+        diem_dat_duoc: r[5]  || '',
+        kt_dat:        r[6]  || '',
+        kt_caithien:   r[7]  || '',
+        kn_dat:        r[8]  || '',
+        kn_caithien:   r[9]  || '',
+        td_dat:        r[10] || '',
+        td_caithien:   r[11] || '',
+        khac_phuc:     r[12] || '',
+        giai_phap:     r[13] || '',
+        word_url:      r[14] || '',
+        is_done:       isDone,
+      });
+    }
+
+    return students;
+  }
+
+  const currentStudents = readFromFile(month, year);
+  const prevStudents    = readFromFile(prev.month, prev.year);
+
+  // Tháng T lên đầu, T-1 phía sau
+  const all = currentStudents.concat(prevStudents);
+
+  const file = findMonthlyFile(month, year) || findMonthlyFile(prev.month, prev.year);
+  return {
+    students: all,
+    file: file ? { id: file.id, url: file.url } : null,
+  };
+}
+
+/**
+ * Lưu báo cáo tháng: frontend truyền student.fileId (không phải cứng file tháng T)
+ */
+function saveMonthlyReport(monthlyFileId, rowIndex, payload, login, studentId) {
+  const teacher = getTeacherByLogin(login);
+  if (!teacher) return { error: 'Tài khoản không tồn tại' };
+
+  const ss = SpreadsheetApp.openById(monthlyFileId);
+  const tab = ss.getSheetByName('Monthly');
+  if (!tab) return { error: 'Không tìm thấy tab Monthly' };
+
+  // Đọc A đến E (cột 1 đến 5)
+  let checkData = tab.getRange(rowIndex, 1, 1, 5).getValues()[0];
+  let rowStudentId = (checkData[0] || '').toString();
+  let teacherInRow = (checkData[4] || '').toString().toLowerCase();
+
+  // Đảm bảo không ghi lệch dòng
+  if (studentId && rowStudentId !== studentId.toString()) {
+    const allStudentIds = tab.getRange(1, 1, tab.getLastRow(), 1).getValues();
+    let foundIndex = -1;
+    for (let i = 1; i < allStudentIds.length; i++) {
+      if (allStudentIds[i][0].toString() === studentId.toString()) {
+        foundIndex = i + 1;
+        break;
+      }
+    }
+    if (foundIndex === -1) {
+      return { error: 'Không tìm thấy học sinh với ID ' + studentId + ' trong tab Monthly' };
+    }
+    rowIndex = foundIndex;
+    checkData = tab.getRange(rowIndex, 1, 1, 5).getValues()[0];
+    rowStudentId = (checkData[0] || '').toString();
+    teacherInRow = (checkData[4] || '').toString().toLowerCase();
+  }
+
+  if (teacherInRow !== teacher.login.toLowerCase()) {
+    return { error: 'Bạn không có quyền sửa dòng này' };
+  }
+
+  const updatedAt = Utilities.formatDate(new Date(), 'GMT+7', 'dd/MM/yyyy HH:mm');
+  tab.getRange(rowIndex, 6, 1, 11).setValues([[
+    payload.diem_dat_duoc || '',
+    payload.kt_dat || '',
+    payload.kt_caithien || '',
+    payload.kn_dat || '',
+    payload.kn_caithien || '',
+    payload.td_dat || '',
+    payload.td_caithien || '',
+    payload.khac_phuc || '',
+    payload.giai_phap || '',
+    '',
+    updatedAt,
+  ]]);
+  return { ok: true };
+}
+
+/**
+ * Xuất Word: frontend truyền student.fileId, student.month, student.year
+ */
+function exportMonthlyReportToWord(monthlyFileId, rowIndex, login, month, year, studentId) {
+  const teacher = getTeacherByLogin(login);
+  if (!teacher) return { error: 'Tài khoản không tồn tại' };
+
+  const ss = SpreadsheetApp.openById(monthlyFileId);
+  const tab = ss.getSheetByName('Monthly');
+  if (!tab) return { error: 'Không tìm thấy tab Monthly' };
+
+  // Đảm bảo không lệch dòng
+  let row = tab.getRange(rowIndex, 1, 1, MONTHLY_HEADERS.length).getValues()[0];
+  let rowStudentId = (row[0] || '').toString();
+  if (studentId && rowStudentId !== studentId.toString()) {
+    const allStudentIds = tab.getRange(1, 1, tab.getLastRow(), 1).getValues();
+    let foundIndex = -1;
+    for (let i = 1; i < allStudentIds.length; i++) {
+      if (allStudentIds[i][0].toString() === studentId.toString()) {
+        foundIndex = i + 1;
+        break;
+      }
+    }
+    if (foundIndex === -1) {
+      return { error: 'Không tìm thấy học sinh với ID ' + studentId + ' trong tab Monthly' };
+    }
+    rowIndex = foundIndex;
+    row = tab.getRange(rowIndex, 1, 1, MONTHLY_HEADERS.length).getValues()[0];
+  }
+
+  if ((row[4] || '').toString().toLowerCase() !== teacher.login.toLowerCase()) {
+    return { error: 'Bạn không có quyền xuất file này' };
+  }
+
+  const data = {
+    student_id: row[0], full_name: row[1], class_code: row[2],
+    teacher_login: row[4], diem: row[5],
+    kt_dat: row[6], kt_caithien: row[7],
+    kn_dat: row[8], kn_caithien: row[9],
+    td_dat: row[10], td_caithien: row[11],
+    khac_phuc: row[12], giai_phap: row[13],
+  };
+
+  const teacherFull = teacher.full_name || teacher.login;
+  const fileName = data.full_name + '_' + data.class_code + '_T' + month + '-' + year;
+  const html = buildMonthlyReportHTML(data, teacherFull, month, year);
+  const blob = Utilities.newBlob(html, 'text/html', fileName + '.html');
+  const folder = DriveApp.getFolderById(CONFIG.NX_FOLDER_ID);
+
+  const subFolderName = 'Báo cáo tháng ' + month + '-' + year;
+  let subFolder;
+  const subFolders = folder.getFoldersByName(subFolderName);
+  if (subFolders.hasNext()) {
+    subFolder = subFolders.next();
+  } else {
+    subFolder = folder.createFolder(subFolderName);
+  }
+
+  const resource = {
+    title: fileName,
+    mimeType: MimeType.GOOGLE_DOCS,
+    parents: [{ id: subFolder.getId() }],
+  };
+  const tempDoc = Drive.Files.insert(resource, blob);
+  const docxUrl = 'https://docs.google.com/document/d/' + tempDoc.id + '/export?format=docx';
+  const docxBlob = UrlFetchApp.fetch(docxUrl, {
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+  }).getBlob().setName(fileName + '.docx');
+
+  const docxFile = subFolder.createFile(docxBlob);
+  DriveApp.getFileById(tempDoc.id).setTrashed(true);
+
+  const url = docxFile.getUrl();
+  tab.getRange(rowIndex, 15).setValue(url);
+
+  return { ok: true, url: url, fileName: fileName + '.docx' };
+}
+
+function buildMonthlyReportHTML(d, teacherFull, month, year) {
+  return '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>' +
+    'body { font-family: "Times New Roman", serif; font-size: 13pt; }' +
+    'h1 { text-align: center; font-size: 16pt; font-weight: bold; margin-bottom: 20px; }' +
+    'p { margin: 8px 0; }' +
+    'table { border-collapse: collapse; width: 100%; margin-top: 16px; }' +
+    'th, td { border: 1px solid #000; padding: 8px; vertical-align: top; text-align: left; }' +
+    'th { background: #f0f0f0; font-weight: bold; text-align: center; }' +
+    '.col-label { width: 18%; font-weight: bold; text-align: center; }' +
+    '.col-content { width: 50%; }' +
+    '.col-improve { width: 32%; }' +
+    '.footer { margin-top: 24px; font-weight: bold; }' +
+    '</style></head><body>' +
+    '<h1>BÁO CÁO HỌC TẬP THÁNG MÔN TOÁN</h1>' +
+    '<p><strong>Họ và tên học sinh:</strong> ' + escapeHTML(d.full_name) + '</p>' +
+    '<p><strong>Mã lớp:</strong> ' + escapeHTML(d.class_code) + '</p>' +
+    '<p><strong>Điểm con đạt được:</strong> ' + escapeHTML(d.diem || 'chưa làm') + '</p>' +
+    '<p><strong>Giáo viên chủ nhiệm:</strong> ' + escapeHTML(teacherFull) + '</p>' +
+    '<table>' +
+    '<tr><th class="col-label">Nội dung</th><th class="col-content">Con đạt được</th><th class="col-improve">Con cần cải thiện</th></tr>' +
+    '<tr><td class="col-label">Kiến thức</td>' +
+    '<td>' + formatMultiline(d.kt_dat) + '</td>' +
+    '<td>' + formatMultiline(d.kt_caithien) + '</td></tr>' +
+    '<tr><td class="col-label">Kỹ năng làm bài</td>' +
+    '<td>' + formatMultiline(d.kn_dat) + '</td>' +
+    '<td>' + formatMultiline(d.kn_caithien) + '</td></tr>' +
+    '<tr><td class="col-label">Thái độ học tập</td>' +
+    '<td colspan="2">' + formatMultiline(d.td_dat) + '</td></tr>' +
+    '<tr><td class="col-label">Những nhược điểm con khắc phục được</td>' +
+    '<td colspan="2">' + formatMultiline(d.khac_phuc) + '</td></tr>' +
+    '<tr><td class="col-label">Giải pháp định hướng</td>' +
+    '<td colspan="2">' + formatMultiline(d.giai_phap) + '</td></tr>' +
+    '</table>' +
+    '<p class="footer">Trân trọng!</p>' +
+    '</body></html>';
+}
+
+function formatMultiline(text) {
+  if (!text) return '';
+  return escapeHTML(text.toString()).replace(/\n/g, '<br>');
+}
+
+function escapeHTML(s) {
+  if (!s) return '';
+  return s.toString()
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function getAiMonthlySuggestion(student, month, year) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY');
+  if (!apiKey) return { suggestion: mockMonthlySuggestion(student) };
+
+  const file = findMonthlyFile(month, year);
+  let weeksData = [];
+  if (file) {
+    const ss = SpreadsheetApp.openById(file.id);
+    const sheets = ss.getSheets().filter(function(s) {
+      const n = s.getName();
+      return !n.startsWith('_') && n !== 'Monthly';
+    });
+    for (let si = 0; si < sheets.length; si++) {
+      const data = sheets[si].getDataRange().getValues();
+      for (let i = 1; i < data.length; i++) {
+        const r = data[i];
+        if (r[1] && r[1].toString() === student.student_id.toString()) {
+          weeksData.push({
+            week: r[0],
+            score_b1: r[8] || '',
+            score_b2: r[9] || '',
+            feedback: r[10] || '',
+          });
+        }
+      }
+    }
+  }
+
+  const weeksContext = weeksData.length > 0
+    ? weeksData.map(function(w) {
+        return 'Tuần ' + w.week + ' - Điểm BTVN B1: ' + w.score_b1 +
+               ', B2: ' + w.score_b2 + '. Nhận xét: ' + w.feedback;
+      }).join('\n---\n')
+    : '(Không có data nhận xét tuần)';
+
+  const prompt = 'Bạn là giáo viên Toán đang viết báo cáo tháng cho phụ huynh học sinh Việt Nam.\n\n' +
+    'Học sinh: ' + student.full_name + '\n' +
+    'Lớp: ' + student.class_code + '\n\n' +
+    'Data các tuần trong tháng:\n' + weeksContext + '\n\n' +
+    'Viết báo cáo tháng tổng hợp theo cấu trúc JSON sau (chỉ trả về JSON, không có markdown wrap):\n' +
+    '{\n' +
+    '  "kt_dat": "Mô tả kiến thức con đã đạt được trong tháng (cụ thể, 3-5 câu, để chỗ trống [GV điền] cho nội dung chuyên môn)",\n' +
+    '  "kt_caithien": "Liệt kê 2-3 điểm con cần cải thiện về kiến thức (gạch đầu dòng)",\n' +
+    '  "kn_dat": "Mô tả kỹ năng làm bài con đạt được (4 câu)",\n' +
+    '  "kn_caithien": "1-2 điểm cần cải thiện về kỹ năng",\n' +
+    '  "td_dat": "Mô tả thái độ học tập tích cực (4 câu)",\n' +
+    '  "khac_phuc": "Liệt kê những nhược điểm con đã khắc phục được trong tháng",\n' +
+    '  "giai_phap": "Giải pháp định hướng cho con (4-5 câu, tích cực, động viên)"\n' +
+    '}';
+
+  try {
+    const response = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        model: 'claude-opus-4-7',
+        max_tokens: 2000,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    const data = JSON.parse(response.getContentText());
+    const text = data.content[0].text.trim();
+    try {
+      const parsed = JSON.parse(text.replace(/^```json\s*|\s*```$/g, ''));
+      return { suggestion: parsed };
+    } catch (e) {
+      return { suggestion: mockMonthlySuggestion(student), parseError: text };
+    }
+  } catch (e) {
+    return { suggestion: mockMonthlySuggestion(student), error: e.toString() };
+  }
+}
+
+function mockMonthlySuggestion(student) {
+  return {
+    kt_dat: 'Trong tháng này, con đã tiếp thu và vận dụng được các kiến thức:\n- [GV điền nội dung kiến thức cụ thể buổi học trong tháng]\n- [Liệt kê các chủ đề/bài học chính]',
+    kt_caithien: '- Con cần rèn thêm về [chủ đề cần cải thiện]\n- Các dạng bài [dạng bài cụ thể] còn yếu',
+    kn_dat: '- Con có thái độ nghiêm túc khi làm bài, biết chủ động suy nghĩ.\n- Bài làm gọn gàng, trình bày rõ ràng.\n- Thực hiện tốt các dạng bài cơ bản.\n- Có nền tảng tính toán tốt.',
+    kn_caithien: '- Con cần rèn thêm kỹ năng [kỹ năng cụ thể] cho đúng yêu cầu.',
+    td_dat: '- Con chủ động và tích cực trong học tập.\n- Lễ phép với thầy cô, thân thiện với bạn bè.\n- Tuân thủ nội quy lớp học.\n- Phối hợp tốt trong hoạt động nhóm.',
+    khac_phuc: '- Con đã chủ động cải thiện những điểm còn yếu.\n- Tích cực tương tác với thầy cô và bạn bè.\n- Cô đánh giá cao sự tiến bộ của con.',
+    giai_phap: '- Con nên thường xuyên ôn luyện và hệ thống lại kiến thức.\n- Lập kế hoạch học tập hợp lý.\n- Khi gặp sai sót, chủ động xem lại từng bước.\n- Trước khi giải bài, nắm chắc yêu cầu.\n- Cô tin con sẽ tiếp tục tiến bộ trong thời gian tới.',
+  };
+}
+
+// ============================================================
+// CRON monthly tab + violations
+// ============================================================
+function cronCreateMonthlyTab() {
+  const now = new Date();
+  const month = now.getMonth() + 1;
+  const year = now.getFullYear();
+  try {
+    const result = buildMonthlyReportList(month, year);
+    Logger.log('Tạo Monthly tab xong: ' + JSON.stringify(result));
+    MailApp.sendEmail({
+      to: CONFIG.ADMIN_EMAIL,
+      subject: '[Sổ Nhận Xét] Đã tạo danh sách HS báo cáo tháng ' + month + '/' + year,
+      htmlBody: '<p>Đã tổng hợp <strong>' + result.total + '</strong> HS active trong tháng ' + month + '/' + year + '</p>' +
+                '<p>Trong đó <strong>' + result.newAdded + '</strong> HS mới thêm vào tab Monthly.</p>' +
+                '<p>Deadline GV viết báo cáo: 23:59 ngày ' + CONFIG.MONTHLY_REPORT_DEADLINE_DAY + '/' + (month < 12 ? month + 1 : 1) + '</p>',
+    });
+  } catch (e) {
+    Logger.log('Lỗi tạo Monthly tab: ' + e);
+    MailApp.sendEmail(CONFIG.ADMIN_EMAIL, '[Sổ Nhận Xét] Lỗi tạo Monthly tab', e.toString());
+  }
+}
+
+function cronCheckMonthlyViolations() {
+  const now = new Date();
+  let prevMonth = now.getMonth();
+  let prevYear = now.getFullYear();
+  if (prevMonth === 0) { prevMonth = 12; prevYear--; }
+
+  const file = findMonthlyFile(prevMonth, prevYear);
+  if (!file) {
+    Logger.log('Không có file tháng ' + prevMonth + '/' + prevYear);
+    return;
+  }
+  const ss = SpreadsheetApp.openById(file.id);
+  const tab = ss.getSheetByName('Monthly');
+  if (!tab) return;
+
+  const data = tab.getDataRange().getValues();
+  const violSS = SpreadsheetApp.openById(CONFIG.VIOLATION_SHEET_ID);
+  let violSheet = violSS.getSheetByName('Danh sách vi phạm');
+  if (!violSheet) {
+    violSheet = violSS.insertSheet('Danh sách vi phạm');
+    violSheet.getRange(1, 1, 1, 5).setValues([['STT', 'Mã lớp', 'Code GV', 'Lý do phạt', 'Thời gian ghi nhận']]);
+    violSheet.getRange(1, 1, 1, 5).setFontWeight('bold').setBackground('#e2ead9');
+    violSheet.setFrozenRows(1);
+  }
+
+  const map = {};
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (!r[0]) continue;
+    const isDone = !!(r[6] || r[8] || r[10]);
+    const key = r[4].toString().toLowerCase() + '|' + r[2];
+    if (!map[key]) map[key] = { teacher: r[4], classCode: r[2], total: 0, done: 0 };
+    map[key].total++;
+    if (isDone) map[key].done++;
+  }
+
+  const violationsSent = getViolationsSet();
+  const warningsSent = getOverdueWarningsSet();
+  const violationSummary = [];
+  const warningSummary = [];
+  const newKeys = [];
+  const newWarningKeys = [];
+
+  for (const key in map) {
+    const m = map[key];
+    const violKey = 'MONTHLY_' + prevMonth + '_' + prevYear + '|' + m.classCode + '|' + m.teacher;
+
+    if (m.done === 0) {
+      if (violationsSent[violKey]) continue;
+      const reason = 'Báo cáo tháng ' + prevMonth + '/' + prevYear +
+                     ' chưa hoàn thành học sinh nào (0/' + m.total +
+                     ' HS) - deadline ' + CONFIG.MONTHLY_REPORT_DEADLINE_DAY + '/' + (prevMonth < 12 ? prevMonth + 1 : 1);
+      violationSummary.push({ classCode: m.classCode, teacher: m.teacher, reason: reason, isDone: m.done, total: m.total, key: violKey });
+    } else if (m.done < m.total) {
+      if (warningsSent[violKey] || violationsSent[violKey]) continue;
+      const reason = 'Báo cáo tháng ' + prevMonth + '/' + prevYear +
+                     ' chưa hoàn thành đầy đủ (' + m.done + '/' + m.total +
+                     ' HS) - deadline ' + CONFIG.MONTHLY_REPORT_DEADLINE_DAY + '/' + (prevMonth < 12 ? prevMonth + 1 : 1);
+      warningSummary.push({ classCode: m.classCode, teacher: m.teacher, reason: reason, isDone: m.done, total: m.total, key: violKey });
+    }
+  }
+
+  // 1. Ghi nhận vi phạm thực tế (done === 0) vào sheet phạt
+  if (violationSummary.length > 0) {
+    const lastRow = violSheet.getLastRow();
+    const newRows = violationSummary.map((v, idx) => [
+      lastRow + idx,
+      v.classCode,
+      v.teacher,
+      v.reason,
+      Utilities.formatDate(now, TIMEZONE, 'HH:mm dd/MM/yyyy'),
+    ]);
+    violSheet.getRange(lastRow + 1, 1, newRows.length, 5).setValues(newRows);
+    
+    violationSummary.forEach(v => newKeys.push(v.key));
+    saveViolationsSet(violationsSent, newKeys);
+
+    // Gửi mail báo vi phạm cho Admin
+    MailApp.sendEmail({
+      to: CONFIG.ADMIN_EMAIL,
+      subject: '[Sổ Nhận Xét] ' + violationSummary.length + ' GV vi phạm deadline báo cáo tháng ' + prevMonth + '/' + prevYear,
+      htmlBody: '<p>Hệ thống ghi nhận các lớp vi phạm báo cáo tháng (chưa nhận xét học sinh nào):</p>' +
+        '<ul>' + violationSummary.map(function(s) { return '<li><strong>' + s.classCode + '</strong> (GV: ' + s.teacher + ') — ' + s.reason + '</li>'; }).join('') + '</ul>' +
+        '<p>Xem chi tiết: <a href="' + violSS.getUrl() + '">' + violSS.getUrl() + '</a></p>',
+    });
+  }
+
+  const lichSS2 = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
+  const teachersData2 = lichSS2.getSheetByName('_Teachers').getDataRange().getValues();
+  const teacherEmailMap2 = {};
+  for (let i = 1; i < teachersData2.length; i++) {
+    const r = teachersData2[i];
+    if (r[0]) teacherEmailMap2[r[0].toString().toLowerCase()] = { email: r[2] || '', name: r[3] || r[0] };
+  }
+
+  const deadlineStr = CONFIG.MONTHLY_REPORT_DEADLINE_DAY + '/' + (prevMonth < 12 ? prevMonth + 1 : 1) + '/' + (prevMonth < 12 ? prevYear : prevYear + 1);
+
+  // Gửi mail vi phạm cho GV (done === 0)
+  const byTeacherViol2 = {};
+  violationSummary.forEach(function(s) {
+    const login = s.teacher.toString().toLowerCase();
+    if (!byTeacherViol2[login]) byTeacherViol2[login] = [];
+    byTeacherViol2[login].push(s);
+  });
+
+  for (const login in byTeacherViol2) {
+    const info = teacherEmailMap2[login];
+    if (!info || !info.email) {
+      Logger.log('Không tìm thấy email GV vi phạm báo cáo tháng: ' + login);
+      continue;
+    }
+    const violations = byTeacherViol2[login];
+    MailApp.sendEmail({
+      to: info.email,
+      subject: '⚠️ [Sổ Nhận Xét] Bạn chưa hoàn thành báo cáo tháng ' + prevMonth + '/' + prevYear,
+      htmlBody:
+        '<p>Xin chào <strong>' + info.name + '</strong>,</p>' +
+        '<p>Hệ thống ghi nhận bạn đã <strong>quá deadline ' + deadlineStr + '</strong> mà chưa hoàn thành báo cáo tháng <strong>' + prevMonth + '/' + prevYear + '</strong> cho các lớp sau:</p>' +
+        '<ul>' + violations.map(function(v) {
+          return '<li><strong>' + v.classCode + '</strong> — ' + v.reason + '</li>';
+        }).join('') + '</ul>' +
+        '<p>Vi phạm này đã được ghi nhận vào hệ thống. Vui lòng vào app hoàn thành ngay:</p>' +
+        '<p><a href="' + ScriptApp.getService().getUrl() + '">👉 Mở Sổ Nhận Xét</a></p>' +
+        '<p><em>Nếu bạn nghĩ đây là nhầm lẫn, hãy liên hệ Admin.</em></p>',
+    });
+    Logger.log('Đã gửi mail vi phạm báo cáo tháng tới GV: ' + info.email);
+  }
+
+  // Gửi mail cảnh báo quá hạn cho GV (0 < done < total)
+  const byTeacherWarn2 = {};
+  warningSummary.forEach(function(s) {
+    const login = s.teacher.toString().toLowerCase();
+    if (!byTeacherWarn2[login]) byTeacherWarn2[login] = [];
+    byTeacherWarn2[login].push(s);
+  });
+
+  for (const login in byTeacherWarn2) {
+    const info = teacherEmailMap2[login];
+    if (!info || !info.email) {
+      Logger.log('Không tìm thấy email GV cảnh báo báo cáo tháng: ' + login);
+      continue;
+    }
+    const warnings = byTeacherWarn2[login];
+    MailApp.sendEmail({
+      to: info.email,
+      subject: '⏰ [Sổ Nhận Xét] Cảnh báo chưa hoàn thành đủ báo cáo tháng ' + prevMonth + '/' + prevYear,
+      htmlBody:
+        '<p>Xin chào <strong>' + info.name + '</strong>,</p>' +
+        '<p>Hệ thống ghi nhận bạn <strong>chưa hoàn thành đầy đủ</strong> báo cáo tháng <strong>' + prevMonth + '/' + prevYear + '</strong> cho các lớp sau:</p>' +
+        '<ul>' + warnings.map(function(w) {
+          return '<li><strong>' + w.classCode + '</strong> — ' + w.reason + '</li>';
+        }).join('') + '</ul>' +
+        '<p>Trường hợp này chưa bị ghi nhận phạt lỗi vi phạm, vui lòng hoàn thành bổ sung sớm nhất có thể:</p>' +
+        '<p><a href="' + ScriptApp.getService().getUrl() + '">👉 Mở Sổ Nhận Xét</a></p>',
+    });
+    Logger.log('Đã gửi mail cảnh báo quá hạn báo cáo tháng tới GV: ' + info.email);
+  }
+
+  warningSummary.forEach(w => newWarningKeys.push(w.key));
+  if (newWarningKeys.length > 0) {
+    saveOverdueWarningsSet(warningsSent, newWarningKeys);
+  }
+
+  Logger.log('Đã xử lý xong check vi phạm báo cáo tháng: ' + violationSummary.length + ' vi phạm và gửi ' + warningSummary.length + ' cảnh báo.');
+}
+
+// ============================================================
+// CRON: tạo file tháng
+// ============================================================
+function cronCreateMonthlyFile() {
+  const now = new Date();
+  createMonthlyFile(now.getMonth() + 1, now.getFullYear());
+}
+
+function createMonthlyFile(month, year) {
+  const fileName = 'Nhận xét tháng ' + month + '/' + year;
+  const folder = DriveApp.getFolderById(CONFIG.NX_FOLDER_ID);
+
+  if (folder.getFilesByName(fileName).hasNext()) {
+    Logger.log('File đã tồn tại: ' + fileName);
+    const f = folder.getFilesByName(fileName).next();
+    return { id: f.getId(), name: fileName, url: f.getUrl() };
+  }
+
+  const template = DriveApp.getFileById(CONFIG.TEMPLATE_FILE_ID);
+  const newFile = template.makeCopy(fileName, folder);
+  const ss = SpreadsheetApp.openById(newFile.getId());
+
+  const oldSheets = ss.getSheets().slice();
+
+  const weeks = getWeeksOfMonth(month, year);
+  for (let i = 0; i < weeks.length; i++) {
+    const sheet = ss.insertSheet(weeks[i]);
+    writeHeader(sheet);
+  }
+
+  for (let i = 0; i < oldSheets.length; i++) {
+    try {
+      ss.deleteSheet(oldSheets[i]);
+    } catch (e) {
+      Logger.log('Không xoá được tab ' + oldSheets[i].getName() + ': ' + e);
+    }
+  }
+
+  const fileUrl = newFile.getUrl();
+  MailApp.sendEmail({
+    to: CONFIG.ADMIN_EMAIL,
+    subject: '[Sổ Nhận Xét] File mới: ' + fileName,
+    htmlBody: '<p>Hệ thống đã tạo file mới:</p>' +
+              '<p><strong>' + fileName + '</strong></p>' +
+              '<p>Link: <a href="' + fileUrl + '">' + fileUrl + '</a></p>' +
+              '<p>Data HS sẽ tự fill khi cron aggregate chạy hoặc khi paste data mới vào _DailySessions.</p>',
+  });
+  Logger.log('Đã tạo: ' + fileName + ' - ' + fileUrl);
+  return { id: newFile.getId(), name: fileName, url: fileUrl };
+}
+
+function cleanupBlankTabs() {
+  const folder = DriveApp.getFolderById(CONFIG.NX_FOLDER_ID);
+  const files = folder.getFiles();
+  let totalCleaned = 0;
+  while (files.hasNext()) {
+    const file = files.next();
+    if (file.getName().indexOf('Nhận xét tháng') !== 0) continue;
+    const ss = SpreadsheetApp.openById(file.getId());
+    const sheets = ss.getSheets();
+    if (sheets.length <= 1) continue;
+    for (let i = 0; i < sheets.length; i++) {
+      const name = sheets[i].getName();
+      if (/^(Sheet|Trang t[íi]nh )\s*\d+$/i.test(name)) {
+        try {
+          ss.deleteSheet(sheets[i]);
+          Logger.log('Đã xoá tab "' + name + '" trong file "' + file.getName() + '"');
+          totalCleaned++;
+        } catch (e) {
+          Logger.log('Lỗi xoá tab: ' + e);
+        }
+      }
+    }
+  }
+  Logger.log('Đã xoá tổng ' + totalCleaned + ' tab trắng');
+  return totalCleaned;
+}
+
+function getWeeksOfMonth(month, year) {
+  const weeks = [];
+  const first = new Date(year, month - 1, 1);
+  const last = new Date(year, month, 0);
+
+  const dow = first.getDay();
+  const offset = dow === 0 ? -6 : 1 - dow;
+  let start = new Date(first);
+  start.setDate(first.getDate() + offset);
+
+  while (start <= last) {
+    const end = new Date(start);
+    end.setDate(start.getDate() + 6);
+    weeks.push(formatDayMonth(start) + ' - ' + formatDayMonth(end));
+    start.setDate(start.getDate() + 7);
+  }
+  return weeks;
+}
+
+// ============================================================
+// CRON: aggregate hàng ngày + check overdue
+// ============================================================
+function cronAggregateDaily() {
+  try {
+    const result = aggregateWeekly();
+    Logger.log('Aggregate xong: ' + JSON.stringify(result));
+  } catch (e) {
+    Logger.log('Lỗi aggregate: ' + e.toString());
+    MailApp.sendEmail(CONFIG.ADMIN_EMAIL, '[Sổ Nhận Xét] Lỗi cron aggregate', e.toString());
+  }
+}
+
+function cronCheckOverdue() {
+  const now = new Date();
+  const month = now.getMonth() + 1;
+  const year = now.getFullYear();
+  const file = findMonthlyFile(month, year);
+  if (!file) return;
+
+  const ss = SpreadsheetApp.openById(file.id);
+  const lichSS = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
+  const teachersData = lichSS.getSheetByName('_Teachers').getDataRange().getValues();
+  const schedules = loadClassSchedules();
+
+  const teacherEmails = {};
+  const tHeaders = teachersData[0];
+  const tEmailCol = tHeaders.indexOf('email');
+  const tLoginCol = tHeaders.indexOf('login');
+  for (let i = 1; i < teachersData.length; i++) {
+    teacherEmails[(teachersData[i][tLoginCol] || '').toString().toLowerCase()] = teachersData[i][tEmailCol];
+  }
+
+  const currentTabs = ss.getSheets().filter(s => {
+    const name = s.getName();
+    if (name.startsWith('_')) return false;
+    const m = name.replace(/\s+/g, '').match(/(\d+)\/(\d+)-(\d+)\/(\d+)/);
+    if (!m) return false;
+    const startDate = new Date(year, parseInt(m[2]) - 1, parseInt(m[1]));
+    const endDate = new Date(year, parseInt(m[4]) - 1, parseInt(m[3]));
+    return now >= startDate && now <= endDate;
+  });
+  if (currentTabs.length === 0) return;
+  const sheet = currentTabs[0];
+  const data = sheet.getDataRange().getValues();
+  const todayDow = now.getDay();
+  const seenClasses = {};
+
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (!r[1]) continue;
+    const status = (r[12] || '').toString();
+    if (status === 'Nghỉ') continue;
+    const classCode = r[4];
+    const teacherLogin = (r[5] || '').toString().toLowerCase();
+    const hasNote = (r[10] || '').toString().trim();
+
+    const sched = schedules[classCode];
+    if (!sched || sched.day2_num === undefined) continue;
+
+    const day2Adj = sched.day2_num === 0 ? 7 : sched.day2_num;
+    const todayAdj = todayDow === 0 ? 7 : todayDow;
+    if (todayAdj - day2Adj < 2) continue;
+
+    const key = teacherLogin + '|' + classCode;
+    if (!seenClasses[key]) seenClasses[key] = { total: 0, done: 0 };
+    seenClasses[key].total++;
+    if (hasNote) seenClasses[key].done++;
+  }
+
+  const overdueMap = {};
+  for (const key in seenClasses) {
+    if (seenClasses[key].done === 0) {
+      const parts = key.split('|');
+      const login = parts[0], classCode = parts[1];
+      if (!overdueMap[login]) overdueMap[login] = [];
+      overdueMap[login].push(classCode);
+    }
+  }
+
+  for (const login in overdueMap) {
+    const email = teacherEmails[login];
+    if (!email) continue;
+    MailApp.sendEmail({
+      to: email,
+      subject: '[Sổ Nhận Xét] Bạn có lớp chưa nhận xét HS nào',
+      htmlBody: '<p>Hệ thống ghi nhận đã quá deadline T+1 mà thầy/cô <strong>chưa nhận xét HS nào</strong>:</p>' +
+                '<ul>' + overdueMap[login].map(c => '<li>' + c + '</li>').join('') + '</ul>' +
+                '<p>Vui lòng vào Sổ Nhận Xét: <a href="' + ScriptApp.getService().getUrl() + '">Mở app</a></p>',
+    });
+  }
+  Logger.log('Đã check overdue: ' + JSON.stringify(overdueMap));
+}
+
+// ============================================================
+// SETUP triggers
+// ============================================================
+function setupTriggers() {
+  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+
+  ScriptApp.newTrigger('cronCreateMonthlyFile')
+    .timeBased().onMonthDay(1).atHour(7).create();
+
+  ScriptApp.newTrigger('cronImportAndAggregate')
+    .timeBased().everyDays(1).atHour(7).create();
+
+  ScriptApp.newTrigger('cronCheckOverdue')
+    .timeBased().everyDays(1).atHour(9).create();
+
+  ScriptApp.newTrigger('cronCheckRemind12h')
+    .timeBased().everyHours(1).create();
+
+  ScriptApp.newTrigger('cronRecordViolations')
+    .timeBased().everyHours(1).create();
+
+  ScriptApp.newTrigger('cronCreateMonthlyTab')
+    .timeBased().onMonthDay(28).atHour(7).create();
+
+  ScriptApp.newTrigger('cronCheckMonthlyViolations')
+    .timeBased().onMonthDay(11).atHour(7).create();
+
+  try {
+    const lichSS = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
+    ScriptApp.newTrigger('onOpen')
+      .forSpreadsheet(lichSS)
+      .onOpen()
+      .create();
+  } catch (e) {
+    Logger.log('Không tạo được trigger onOpen: ' + e);
+  }
+
+  Logger.log('Đã setup 7 triggers + onOpen menu');
+}
+
+// ============================================================
+// Chạy thủ công
+// ============================================================
+function runAggregateNow() {
+  const result = aggregateWeekly();
+  Logger.log('Đã aggregate: ' + JSON.stringify(result));
+  return result;
+}
+
+// ============================================================
+// REST API - Cổng vào cho Vercel (hỗ trợ truy cập từ xa)
+// ============================================================
+function doPost(e) {
+  try {
+    const requestData = JSON.parse(e.postData.contents);
+    const action = requestData.action;
+    const args = requestData.args || [];
+    
+    let result;
+    if (action === 'authenticate') {
+      result = authenticate(args[0], args[1]);
+    } else if (action === 'loadDashboardData') {
+      result = loadDashboardData(args[0], args[1], args[2]);
+    } else if (action === 'getStudentsInWeek') {
+      result = getStudentsInWeek(args[0], args[1], args[2]);
+    } else if (action === 'saveFeedback') {
+      result = saveFeedback(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9]);
+    } else if (action === 'getStudentHistory') {
+      result = getStudentHistory(args[0], args[1], args[2], args[3]);
+    } else if (action === 'getAiSuggestion') {
+      result = getAiSuggestion(args[0]);
+    } else if (action === 'getDeadlinesForTeacher') {
+      result = getDeadlinesForTeacher(args[0], args[1], args[2]);
+    } else if (action === 'getMonthlyStudents') {
+      result = getMonthlyStudents(args[0], args[1], args[2]);
+    } else if (action === 'saveMonthlyReport') {
+      result = saveMonthlyReport(args[0], args[1], args[2], args[3], args[4]);
+    } else if (action === 'exportMonthlyReportToWord') {
+      result = exportMonthlyReportToWord(args[0], args[1], args[2], args[3], args[4], args[5]);
+    } else if (action === 'getAiMonthlySuggestion') {
+      result = getAiMonthlySuggestion(args[0], args[1], args[2]);
+    } else {
+      result = { error: 'Không tìm thấy hành động: ' + action };
+    }
+    
+    return ContentService.createTextOutput(JSON.stringify(result))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch (error) {
+    return ContentService.createTextOutput(JSON.stringify({ error: error.toString() }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+// ── DIAGNOSTIC FUNCTION FOR PIC COLUMN ──
+function debugPicColumn() {
+  const ui = SpreadsheetApp.getUi();
+  const logs = [];
+  
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
+    const sheet = ss.getSheetByName('Danh sách lớp Edupia Math');
+    if (!sheet) {
+      logs.push('❌ LỖI: Không tìm thấy tab "Danh sách lớp Edupia Math"');
+    } else {
+      const headers = sheet.getDataRange().getValues()[0] || [];
+      logs.push('✅ Tiêu đề trong Danh sách lớp: ' + JSON.stringify(headers));
+      
+      let picIdx = -1;
+      for (let j = 0; j < headers.length; j++) {
+        const h = (headers[j] || '').toString().trim().toUpperCase();
+        if (h === 'PIC' || h === 'PIC GVCN') {
+          picIdx = j;
+        }
+      }
+      logs.push('🔍 Vị trí cột PIC tìm được: Index ' + picIdx + (picIdx >= 0 ? ' (Cột ' + String.fromCharCode(65 + picIdx) + ')' : ' (Không tìm thấy, fallback sang R/17)'));
+      
+      const schedules = loadClassSchedules();
+      const sampleClasses = Object.keys(schedules).slice(0, 5);
+      logs.push('📋 Một số lớp mẫu trong bộ nhớ cache/schedules:');
+      sampleClasses.forEach(c => {
+        logs.push('  - Lớp ' + c + ': PIC = "' + schedules[c].pic + '", GV = "' + schedules[c].teacher_login + '"');
+      });
+    }
+
+    const file = findMonthlyFile(6, 2026);
+    if (!file) {
+      logs.push('❌ LỖI: Không tìm thấy file Nhận xét tháng 06/2026');
+    } else {
+      const fileSS = SpreadsheetApp.openById(file.id);
+      const tab = fileSS.getSheetByName('08/06 - 14/06');
+      if (!tab) {
+        logs.push('❌ LỖI: Không tìm thấy tab tuần "08/06 - 14/06" trong file tháng 6');
+      } else {
+        const weekHeaders = tab.getRange(1, 1, 1, tab.getLastColumn()).getValues()[0] || [];
+        logs.push('✅ Tiêu đề trong tab tuần "08/06 - 14/06": ' + JSON.stringify(weekHeaders));
+        logs.push('🔍 Vị trí cột "PIC" trong tuần: Index ' + weekHeaders.indexOf('PIC'));
+        
+        const sampleRows = tab.getRange(1, 1, Math.min(5, tab.getLastRow()), tab.getLastColumn()).getValues();
+        logs.push('📋 Dữ liệu các dòng đầu của tuần "08/06 - 14/06":');
+        sampleRows.forEach((r, idx) => {
+          logs.push('  - Hàng ' + (idx + 1) + ': ' + JSON.stringify(r));
+        });
+      }
+    }
+  } catch (e) {
+    logs.push('❌ LỖI KHI CHẠY DEBUG: ' + e.toString());
+  }
+
+  // Hiển thị logs dưới dạng Modal Dialog hoặc ghi vào Logger
+  Logger.log(logs.join('\n'));
+  const html = HtmlService.createHtmlOutput('<pre style="font-family: monospace; font-size: 12px; white-space: pre-wrap;">' + logs.join('\n') + '</pre>')
+    .setWidth(600)
+    .setHeight(450);
+  ui.showModalDialog(html, 'Kết quả kiểm tra cột PIC');
+}
+
+// ── FIX: Vá trực tiếp cột PIC cho tất cả sheet tuần (chạy từ editor) ──────
+// Chạy hàm này trực tiếp từ nút ▶ Run trong Apps Script Editor để vá cột PIC
+// cho TẤT CẢ các sheet tuần trong file Nhận xét tháng hiện tại và tháng trước.
+function fixPicColumn() {
+  // 1. Xóa cache schedules để đảm bảo đọc lại dữ liệu mới nhất từ sheet
+  try {
+    CacheService.getScriptCache().remove('class_schedules_compressed');
+    Logger.log('✅ Đã xóa cache schedules');
+  } catch(e) {
+    Logger.log('⚠️ Không xóa được cache: ' + e);
+  }
+
+  // 2. Đọc lại schedules (có PIC)
+  const schedules = loadClassSchedules();
+  Logger.log('✅ Đã load ' + Object.keys(schedules).length + ' lớp từ Danh sách lớp');
+
+  // Kiểm tra xem PIC có được đọc đúng chưa — ghi 5 lớp mẫu vào log
+  const sampleKeys = Object.keys(schedules).slice(0, 5);
+  sampleKeys.forEach(k => {
+    Logger.log('  Lớp ' + k + ': PIC="' + schedules[k].pic + '"');
+  });
+
+  // 3. Tìm và vá tất cả file Nhận xét trong 2 tháng gần nhất
+  const now = new Date();
+  const months = [
+    { m: now.getMonth() + 1, y: now.getFullYear() },
+    { m: now.getMonth() === 0 ? 12 : now.getMonth(), y: now.getMonth() === 0 ? now.getFullYear() - 1 : now.getFullYear() }
+  ];
+
+  let totalFixed = 0;
+  let totalSheets = 0;
+
+  months.forEach(mo => {
+    const file = findMonthlyFile(mo.m, mo.y);
+    if (!file) {
+      Logger.log('⚠️ Không tìm thấy file tháng ' + mo.m + '/' + mo.y);
+      return;
+    }
+
+    const fileSS = SpreadsheetApp.openById(file.id);
+    const sheets = fileSS.getSheets();
+    Logger.log('📁 File tháng ' + mo.m + '/' + mo.y + ': ' + sheets.length + ' sheet');
+
+    sheets.forEach(sheet => {
+      const sheetName = sheet.getName();
+      if (sheetName === 'Monthly') return; // Bỏ qua sheet báo cáo tháng
+
+      const lastRow = sheet.getLastRow();
+      const lastCol = sheet.getLastColumn();
+      if (lastRow < 2 || lastCol < 5) return;
+
+      // Đọc header để xác định vị trí cột E (index 4 = Mã lớp) và cột N (index 13 = PIC)
+      const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+      const classColIdx = headers.indexOf('Mã lớp');       // thường là 4 (cột E)
+      const picColIdx   = headers.indexOf('PIC');           // thường là 13 (cột N)
+
+      if (classColIdx < 0) {
+        Logger.log('  ⚠️ Sheet "' + sheetName + '": Không tìm thấy cột "Mã lớp", bỏ qua');
+        return;
+      }
+      if (picColIdx < 0) {
+        // Header chưa có PIC → nâng cấp header trước
+        writeHeader(sheet);
+        Logger.log('  🔧 Sheet "' + sheetName + '": Đã nâng cấp header (thêm cột PIC)');
+        // Tính lại sau khi ghi header
+        const newHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+        const newPicIdx = newHeaders.indexOf('PIC');
+        if (newPicIdx < 0) {
+          Logger.log('  ❌ Sheet "' + sheetName + '": Vẫn không tìm thấy cột PIC sau khi nâng cấp, bỏ qua');
+          return;
+        }
+      }
+
+      // Đọc lại headers sau khi có thể đã nâng cấp
+      const currentLastCol = sheet.getLastColumn();
+      const currentHeaders = sheet.getRange(1, 1, 1, currentLastCol).getValues()[0];
+      const picCol = currentHeaders.indexOf('PIC') + 1;   // +1 vì getRange dùng 1-indexed
+      const classCol = currentHeaders.indexOf('Mã lớp') + 1;
+
+      if (picCol <= 0 || classCol <= 0) return;
+
+      // Đọc tất cả dữ liệu từ hàng 2
+      const currentLastRow = sheet.getLastRow();
+      if (currentLastRow < 2) return;
+
+      const data = sheet.getRange(2, classCol, currentLastRow - 1, 1).getValues();
+      const picUpdates = [];
+
+      data.forEach((row, i) => {
+        const classCodeRaw = (row[0] || '').toString().trim();
+        if (!classCodeRaw) return;
+
+        const classNorm = normalizeClassCode(classCodeRaw);
+        const sched = schedules[classNorm];
+        const pic = sched ? (sched.pic || '') : '';
+
+        picUpdates.push([pic]);
+      });
+
+      if (picUpdates.length > 0) {
+        sheet.getRange(2, picCol, picUpdates.length, 1).setValues(picUpdates);
+        const fixed = picUpdates.filter(r => r[0] !== '').length;
+        totalFixed += fixed;
+        Logger.log('  ✅ Sheet "' + sheetName + '": Đã vá ' + fixed + '/' + picUpdates.length + ' dòng có PIC');
+      }
+
+      totalSheets++;
+      Utilities.sleep(100); // tránh vượt quota API
+    });
+  });
+
+  Logger.log('🎉 Hoàn tất! Đã vá ' + totalFixed + ' dòng PIC trên ' + totalSheets + ' sheet tuần.');
+  Logger.log('👉 Kết quả chi tiết xem trong Execution Log ở trên.');
+}
