@@ -559,6 +559,8 @@ function App() {
                             <p className="text-xs text-[var(--muted)] font-mono mt-0.5">
                               ID: {s.student_id}
                               {s.attendance_status === 'Nghỉ 1 buổi' && <span className="ml-2 px-2 py-0.5 bg-orange-100 text-orange-800 rounded-full text-[10px] font-semibold">Nghỉ 1 buổi</span>}
+                              {s.attendance_status === 'Học đủ (chờ xác nhận B2)' && <span className="ml-2 px-2 py-0.5 bg-blue-100 text-blue-800 rounded-full text-[10px] font-semibold">Chờ xác nhận B2</span>}
+                              {s.attendance_status === 'Nghỉ B1 (chờ xác nhận B2)' && <span className="ml-2 px-2 py-0.5 bg-amber-100 text-amber-800 rounded-full text-[10px] font-semibold">Nghỉ B1 · chờ B2</span>}
                             </p>
                             {s.note && <p className="text-xs mt-2 italic" style={{color:s.is_gifted?'#854F0B':'var(--muted)'}}>{s.note}</p>}
                             {!s.is_absent && (
@@ -927,6 +929,16 @@ ${note}`;
               {student.is_gifted && (
                 <div style={{background:'#FAEEDA',border:'1px solid #EF9F27',borderRadius:8,padding:'12px 16px',fontSize:13,color:'#854F0B'}}>
                   🎁 <strong>HS tặng buổi</strong> — {student.note}
+                </div>
+              )}
+              {student.attendance_status === 'Học đủ (chờ xác nhận B2)' && (
+                <div style={{background:'#EFF6FF',border:'1px solid #BFDBFE',borderRadius:8,padding:'12px 16px',fontSize:13,color:'#1D4ED8'}}>
+                  <strong>Chờ xác nhận buổi 2</strong> — Hệ thống chưa nhận được kết quả điểm danh cuối cùng của buổi 2. Thầy/cô vẫn có thể điền nhận xét tuần ngay bây giờ.
+                </div>
+              )}
+              {student.attendance_status === 'Nghỉ B1 (chờ xác nhận B2)' && (
+                <div style={{background:'#FFFBEB',border:'1px solid #FDE68A',borderRadius:8,padding:'12px 16px',fontSize:13,color:'#92400E'}}>
+                  <strong>Buổi 1 nghỉ · Buổi 2 chờ xác nhận</strong> — Con đã nghỉ buổi 1. Buổi 2 hệ thống chưa nhận được kết quả điểm danh cuối cùng nên có thể con vẫn học đầy đủ. Thầy/cô vẫn có thể điền nhận xét và điểm BTVN buổi 2 ngay bây giờ.
                 </div>
               )}
               {student.note && !student.is_gifted && !student.is_absent && (
