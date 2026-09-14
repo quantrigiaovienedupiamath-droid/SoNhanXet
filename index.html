@@ -328,6 +328,11 @@ function App() {
   const [currentMonth] = useState(now.getMonth() + 1);
   const [currentYear]  = useState(now.getFullYear());
 
+  // Tháng mục tiêu báo cáo (Tháng T = currentMonth - 1 khi đang ở tháng T+1)
+  const reportTargetMonth = currentMonth === 1 ? 12 : currentMonth - 1;
+  const reportTargetYear  = currentMonth === 1 ? currentYear - 1 : currentYear;
+  const [selectedMonthFilter, setSelectedMonthFilter] = useState('ALL');
+
   // Tick mỗi 30 giây để cập nhật countdown
   useEffect(() => {
     const id = setInterval(() => setNowTick(Date.now()), 30000);
@@ -347,8 +352,8 @@ function App() {
   useEffect(() => {
     if (mainTab !== 'month' || !teacher) return;
     setLoadingMonthly(true);
-    // ── THAY ĐỔI: backend trả về students của cả T và T-1
-    callApi('getMonthlyStudents', teacher.login, currentMonth, currentYear).then(d => {
+    // Truyền reportTargetMonth (tháng T) để lấy data của tháng T và tháng T-1
+    callApi('getMonthlyStudents', teacher.login, reportTargetMonth, reportTargetYear).then(d => {
       if (d.error) { setError(d.error); setLoadingMonthly(false); return; }
       setMonthlyStudents(d.students || []);
       setMonthlyFile(d.file);
@@ -357,8 +362,10 @@ function App() {
   }, [mainTab, teacher?.login]);
 
   const reloadMonthly = async () => {
-    const d = await callApi('getMonthlyStudents', teacher.login, currentMonth, currentYear);
+    setLoadingMonthly(true);
+    const d = await callApi('getMonthlyStudents', teacher.login, reportTargetMonth, reportTargetYear);
     if (d.students) setMonthlyStudents(d.students);
+    setLoadingMonthly(false);
   };
 
   // Load dashboard lần đầu
@@ -620,19 +627,7 @@ function App() {
           <div className="mb-6 flex justify-between items-end flex-wrap gap-4">
             <div>
               <p className="text-xs font-mono uppercase tracking-[0.2em] text-[var(--muted)] mb-2">
-                {(() => {
-                  const today = new Date();
-                  const day = today.getDate();
-                  // Trước ngày 8: đang điền báo cáo tháng T-1
-                  // Từ ngày 8 trở đi: đang điền báo cáo tháng T
-                  if (day <= 7) {
-                    const reportMonth = currentMonth === 1 ? 12 : currentMonth - 1;
-                    const reportYear  = currentMonth === 1 ? currentYear - 1 : currentYear;
-                    return `Tháng ${reportMonth}/${reportYear} & tháng trước`;
-                  } else {
-                    return `Tháng ${currentMonth}/${currentYear} & tháng trước`;
-                  }
-                })()}
+                Tháng {reportTargetMonth}/{reportTargetYear} & tháng trước
               </p>
               <h1 className="font-display text-4xl md:text-5xl font-semibold leading-none">Báo cáo tháng</h1>
             </div>
@@ -641,32 +636,9 @@ function App() {
             </button>
           </div>
           <p className="mt-3 text-[var(--muted)] max-w-2xl">
-              {(() => {
-                const today = new Date();
-                const day = today.getDate();
-                if (day <= 7) {
-                  // Trước ngày 8/T: báo cáo tháng T-1, deadline ngày 7/T
-                  const reportMonth = currentMonth === 1 ? 12 : currentMonth - 1;
-                  const reportYear  = currentMonth === 1 ? currentYear - 1 : currentYear;
-                  return (
-                    <>
-                      Viết báo cáo tổng kết tháng cho từng HS. Danh sách bao gồm tháng {reportMonth}/{reportYear} và tháng trước.
-                      <strong> Deadline tháng này: 23:59 ngày 7/{currentMonth}/{currentYear}</strong>.
-                    </>
-                  );
-                } else {
-                  // Từ ngày 8/T: báo cáo tháng T, deadline ngày 7/T+1
-                  const deadlineMonth = currentMonth < 12 ? currentMonth + 1 : 1;
-                  const deadlineYear  = currentMonth < 12 ? currentYear : currentYear + 1;
-                  return (
-                    <>
-                      Viết báo cáo tổng kết tháng cho từng HS. Danh sách bao gồm tháng {currentMonth}/{currentYear} và tháng trước.
-                      <strong> Deadline tháng này: 23:59 ngày 7/{deadlineMonth}/{deadlineYear}</strong>.
-                    </>
-                  );
-                }
-              })()}
-            </p>
+            Viết báo cáo tổng kết tháng cho từng HS. Danh sách bao gồm tháng {reportTargetMonth}/{reportTargetYear} và tháng trước.
+            <strong> Deadline tháng này: 23:59 ngày 7/{currentMonth}/{currentYear}</strong>.
+          </p>
 
           {loadingMonthly ? (
             <div className="paper-card rounded-lg p-12 text-center text-[var(--muted)] font-mono text-sm">Đang tải danh sách HS...</div>
@@ -677,76 +649,117 @@ function App() {
             </div>
           ) : (
             <>
-              <div className="mb-6">
-                <div className="text-xs font-mono uppercase tracking-wider text-[var(--muted)] mb-1">Tổng tiến độ</div>
-                <div className="flex items-baseline gap-4">
-                  <span className="font-display text-3xl font-semibold">
-                    {monthlyStudents.filter(s => s.is_done).length}<span className="text-[var(--muted)] text-xl">/{monthlyStudents.length}</span>
-                  </span>
-                  <div className="flex-1 max-w-md h-1.5 bg-[var(--paper-2)] rounded-full overflow-hidden">
-                    <div className="h-full bg-[var(--accent)] transition-all"
-                      style={{width:`${monthlyStudents.length>0?monthlyStudents.filter(s=>s.is_done).length/monthlyStudents.length*100:0}%`}}/>
-                  </div>
-                </div>
-              </div>
-
-              {/* ── THAY ĐỔI: group theo monthLabel (tháng T trước, T-1 sau) */}
               {(() => {
-                // Gom theo monthLabel
-                const byMonth = {};
-                monthlyStudents.forEach(s => {
-                  if (!byMonth[s.monthLabel]) byMonth[s.monthLabel] = [];
-                  byMonth[s.monthLabel].push(s);
-                });
+                const availableMonthLabels = Array.from(new Set(monthlyStudents.map(s => s.monthLabel).filter(Boolean)));
+                const displayedStudents = selectedMonthFilter === 'ALL'
+                  ? monthlyStudents
+                  : monthlyStudents.filter(s => s.monthLabel === selectedMonthFilter);
+                const totalDone = displayedStudents.filter(s => s.is_done).length;
+                const totalCount = displayedStudents.length;
 
-                return Object.entries(byMonth).map(([monthLabel, mStudents]) => {
-                  const byClass = {};
-                  mStudents.forEach(s => {
-                    if (!byClass[s.class_code]) byClass[s.class_code] = [];
-                    byClass[s.class_code].push(s);
-                  });
-                  const mDone = mStudents.filter(s => s.is_done).length;
-
-                  return (
-                    <div key={monthLabel} className="month-divider">
-                      <div className="flex items-center gap-3 mb-5">
-                        <h2 className="font-display text-2xl font-semibold" style={{color:'var(--accent-dark)'}}>{monthLabel}</h2>
-                        <span className={`chip ${mDone===mStudents.length?'chip-good':'chip-warn'}`}>
-                          {mDone}/{mStudents.length} đã viết
-                        </span>
+                return (
+                  <>
+                    {/* ── Bộ chọn lọc tháng ───────────────────────── */}
+                    {availableMonthLabels.length > 0 && (
+                      <div className="mt-6 mb-6 flex items-center gap-3 flex-wrap">
+                        <span className="text-xs font-mono uppercase tracking-wider text-[var(--muted)]">Xem tháng:</span>
+                        <div className="flex gap-1 p-1 bg-[var(--paper-2)] rounded-md inline-flex flex-wrap">
+                          <button
+                            onClick={() => setSelectedMonthFilter('ALL')}
+                            className={`px-3 py-1.5 text-xs rounded font-medium transition-all ${selectedMonthFilter === 'ALL' ? 'bg-[var(--ink)] text-[var(--paper)]' : 'text-[var(--ink)] hover:bg-black/5'}`}>
+                            Tất cả các tháng ({availableMonthLabels.length})
+                          </button>
+                          {availableMonthLabels.map(mLabel => {
+                            const mCount = monthlyStudents.filter(s => s.monthLabel === mLabel).length;
+                            const mDone = monthlyStudents.filter(s => s.monthLabel === mLabel && s.is_done).length;
+                            return (
+                              <button
+                                key={mLabel}
+                                onClick={() => setSelectedMonthFilter(mLabel)}
+                                className={`px-3 py-1.5 text-xs rounded font-medium transition-all ${selectedMonthFilter === mLabel ? 'bg-[var(--ink)] text-[var(--paper)]' : 'text-[var(--ink)] hover:bg-black/5'}`}>
+                                {mLabel} ({mDone}/{mCount})
+                              </button>
+                            );
+                          })}
+                        </div>
                       </div>
+                    )}
 
-                      {Object.entries(byClass).map(([code, list], i) => {
-                        const done = list.filter(s => s.is_done).length;
-                        return (
-                          <section key={code} className="mb-8 fade-up" style={{animationDelay:`${i*60}ms`}}>
-                            <div className="flex items-center gap-3 mb-3 flex-wrap">
-                              <h3 className="font-display font-semibold text-xl leading-tight">{code}</h3>
-                              <span className={`chip ${done===list.length?'chip-good':'chip-warn'}`}>{done}/{list.length} đã viết</span>
-                            </div>
-                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                              {list.map(s => (
-                                <button key={s.rowIndex + '_' + s.fileId} onClick={() => setSelectedMonthly(s)}
-                                  className="paper-card rounded-lg p-4 text-left hover:shadow-lg transition-all hover:-translate-y-0.5 relative">
-                                  {s.is_done && <div className="absolute top-2 right-2"><span className="stamp">đã viết</span></div>}
-                                  <h3 className="font-display font-semibold text-lg leading-tight pr-12">{s.full_name}</h3>
-                                  <p className="text-xs text-[var(--muted)] font-mono mt-0.5">ID: {s.student_id}</p>
-                                  <p className="text-xs text-[var(--muted)] font-mono mt-1">Bắt đầu: {s.start_date}</p>
-                                  {s.word_url && (
-                                    <a href={s.word_url} target="_blank" onClick={e => e.stopPropagation()}
-                                      className="inline-block mt-2 text-xs font-mono text-[var(--accent)] hover:underline">
-                                      📄 Mở file Word ↗
-                                    </a>
-                                  )}
-                                </button>
-                              ))}
-                            </div>
-                          </section>
-                        );
-                      })}
+                    {/* ── Thanh tiến độ ──────────────────────────── */}
+                    <div className="mb-6">
+                      <div className="text-xs font-mono uppercase tracking-wider text-[var(--muted)] mb-1">
+                        {selectedMonthFilter === 'ALL' ? 'Tổng tiến độ (tất cả các tháng)' : `Tiến độ ${selectedMonthFilter}`}
+                      </div>
+                      <div className="flex items-baseline gap-4">
+                        <span className="font-display text-3xl font-semibold">
+                          {totalDone}<span className="text-[var(--muted)] text-xl">/{totalCount}</span>
+                        </span>
+                        <div className="flex-1 max-w-md h-1.5 bg-[var(--paper-2)] rounded-full overflow-hidden">
+                          <div className="h-full bg-[var(--accent)] transition-all"
+                            style={{width:`${totalCount > 0 ? (totalDone / totalCount * 100) : 0}%`}}/>
+                        </div>
+                      </div>
                     </div>
-                  );
-                });
+
+                    {/* ── Danh sách học sinh theo tháng và lớp ────── */}
+                    {(() => {
+                      const byMonth = {};
+                      displayedStudents.forEach(s => {
+                        if (!byMonth[s.monthLabel]) byMonth[s.monthLabel] = [];
+                        byMonth[s.monthLabel].push(s);
+                      });
+
+                      return Object.entries(byMonth).map(([monthLabel, mStudents]) => {
+                        const byClass = {};
+                        mStudents.forEach(s => {
+                          if (!byClass[s.class_code]) byClass[s.class_code] = [];
+                          byClass[s.class_code].push(s);
+                        });
+                        const mDone = mStudents.filter(s => s.is_done).length;
+
+                        return (
+                          <div key={monthLabel} className="month-divider">
+                            <div className="flex items-center gap-3 mb-5">
+                              <h2 className="font-display text-2xl font-semibold" style={{color:'var(--accent-dark)'}}>{monthLabel}</h2>
+                              <span className={`chip ${mDone===mStudents.length?'chip-good':'chip-warn'}`}>
+                                {mDone}/{mStudents.length} đã viết
+                              </span>
+                            </div>
+
+                            {Object.entries(byClass).map(([code, list], i) => {
+                              const done = list.filter(s => s.is_done).length;
+                              return (
+                                <section key={code} className="mb-8 fade-up" style={{animationDelay:`${i*60}ms`}}>
+                                  <div className="flex items-center gap-3 mb-3 flex-wrap">
+                                    <h3 className="font-display font-semibold text-xl leading-tight">{code}</h3>
+                                    <span className={`chip ${done===list.length?'chip-good':'chip-warn'}`}>{done}/{list.length} đã viết</span>
+                                  </div>
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                                    {list.map(s => (
+                                      <button key={s.rowIndex + '_' + s.fileId} onClick={() => setSelectedMonthly(s)}
+                                        className="paper-card rounded-lg p-4 text-left hover:shadow-lg transition-all hover:-translate-y-0.5 relative">
+                                        {s.is_done && <div className="absolute top-2 right-2"><span className="stamp">đã viết</span></div>}
+                                        <h3 className="font-display font-semibold text-lg leading-tight pr-12">{s.full_name}</h3>
+                                        <p className="text-xs text-[var(--muted)] font-mono mt-0.5">ID: {s.student_id}</p>
+                                        <p className="text-xs text-[var(--muted)] font-mono mt-1">Bắt đầu: {s.start_date}</p>
+                                        {s.word_url && (
+                                          <a href={s.word_url} target="_blank" onClick={e => e.stopPropagation()}
+                                            className="inline-block mt-2 text-xs font-mono text-[var(--accent)] hover:underline">
+                                            📄 Mở file Word ↗
+                                          </a>
+                                        )}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </section>
+                              );
+                            })}
+                          </div>
+                        );
+                      });
+                    })()}
+                  </>
+                );
               })()}
             </>
           )}
