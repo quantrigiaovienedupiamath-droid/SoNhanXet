@@ -563,7 +563,6 @@ function App() {
                               {s.attendance_status === 'Nghỉ B1 (chờ xác nhận B2)' && <span className="ml-2 px-2 py-0.5 bg-amber-100 text-amber-800 rounded-full text-[10px] font-semibold">Nghỉ B1 · chờ B2</span>}
                             </p>
                             {s.note && <p className="text-xs mt-2 italic" style={{color:s.is_gifted?'#854F0B':'var(--muted)'}}>{s.note}</p>}
-                            {!s.is_absent && (
                               <div className="flex items-center gap-3 mt-3 flex-wrap">
                                 <div>
                                   <div className="text-[10px] font-mono uppercase text-[var(--muted)] mb-1">Điểm BTVN B1</div>
@@ -574,7 +573,6 @@ function App() {
                                   <span className={`chip ${b2.cls}`}>{b2.text}</span>
                                 </div>
                               </div>
-                            )}
                             {s.status && (
                               <div className="mt-3 pt-3 border-t border-dashed border-[var(--line)] text-xs font-mono text-[var(--muted)] flex justify-between items-center flex-wrap gap-1">
                                 <span>Đánh giá: <span className="text-[var(--ink)] font-medium">{s.status}</span></span>
@@ -832,7 +830,7 @@ function DetailPanel({ student, fileId, tab, currentMonth, currentYear, teacherL
   };
 
   const generateParent = () =>
-`BÁO CÁO HỌC TẬP TUẦN ${student.week}
+`BÁO CÁO HỌC TẬP TUẦN ${tab || student.week}
 
 Họ tên học sinh: ${student.full_name}.
 Lớp: ${student.class_code}.
@@ -923,7 +921,7 @@ ${note}`;
             <div className="space-y-5 fade-up">
               {student.is_absent && (
                 <div style={{background:'#F1EFE8',border:'1px solid #B4B2A9',borderRadius:8,padding:'12px 16px',fontSize:13}}>
-                  <strong>HS nghỉ cả tuần</strong> — không cần viết nhận xét tuần này.
+                  <strong>HS nghỉ cả tuần</strong> — không bắt buộc viết nhận xét, nhưng vẫn có thể điền điểm BTVN.
                 </div>
               )}
               {student.is_gifted && (
@@ -964,7 +962,7 @@ ${note}`;
                   <label className="text-xs font-mono text-[var(--muted)] uppercase mb-2 block">BTVN B1</label>
                   <select className="field w-full text-center font-display text-sm font-semibold"
                     style={{padding:'8px 10px'}}
-                    value={scoreB1} onChange={e => setScoreB1(e.target.value)} disabled={student.is_absent}>
+                    value={scoreB1} onChange={e => setScoreB1(e.target.value)}>
                     <option value="">— Chọn —</option>
                     {renderedOptionsB1.map(opt => (
                       <option key={opt} value={opt}>{opt}</option>
@@ -975,7 +973,7 @@ ${note}`;
                   <label className="text-xs font-mono text-[var(--muted)] uppercase mb-2 block">BTVN B2</label>
                   <select className="field w-full text-center font-display text-sm font-semibold"
                     style={{padding:'8px 10px'}}
-                    value={scoreB2} onChange={e => setScoreB2(e.target.value)} disabled={student.is_absent}>
+                    value={scoreB2} onChange={e => setScoreB2(e.target.value)}>
                     <option value="">— Chọn —</option>
                     {renderedOptionsB2.map(opt => (
                       <option key={opt} value={opt}>{opt}</option>
@@ -1023,7 +1021,7 @@ ${note}`;
                 <button onClick={copyParent} disabled={!note.trim()} className="ghost-btn px-5 py-2.5 rounded-md text-sm font-medium disabled:opacity-40">
                   {copied ? '✓ Đã copy' : 'Copy mẫu gửi PH'}
                 </button>
-                <button onClick={handleSave} disabled={!note.trim() || saving} className="accent-btn px-5 py-2.5 rounded-md text-sm font-medium flex-1 disabled:opacity-40">
+                <button onClick={handleSave} disabled={saving} className="accent-btn px-5 py-2.5 rounded-md text-sm font-medium flex-1 disabled:opacity-40">
                   {saving ? 'Đang lưu...' : 'Lưu vào Google Sheet'}
                 </button>
               </div>
