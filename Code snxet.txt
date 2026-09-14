@@ -217,6 +217,24 @@ function getPrevMonth(month, year) {
     : { month: month - 1, year: year };
 }
 
+function formatDateTimeGAS(val) {
+  if (!val) return '';
+  if (val instanceof Date) {
+    return Utilities.formatDate(val, 'GMT+7', 'dd/MM/yyyy HH:mm');
+  }
+  const str = val.toString().trim();
+  if (!str) return '';
+  if (/^\d{1,2}\/\d{1,2}\/\d{4}\s+\d{1,2}:\d{1,2}/.test(str)) {
+    return str;
+  }
+  const cleaned = str.replace(/\s*\([^)]*\)$/, '');
+  const d = new Date(cleaned);
+  if (!isNaN(d.getTime())) {
+    return Utilities.formatDate(d, 'GMT+7', 'dd/MM/yyyy HH:mm');
+  }
+  return str;
+}
+
 // ============================================================
 // READ: lịch lớp (có cache 5 phút)
 // ============================================================
@@ -435,7 +453,7 @@ function loadDashboardData(login, month, year) {
           is_gifted: (row[6] || '').toString().indexOf('🎁') >= 0,
           is_absent: (row[12] || '').toString() === 'Nghỉ',
           attendance_status: row[12] || '',
-          updated_at: row[14] ? (row[14] instanceof Date ? Utilities.formatDate(row[14], 'GMT+7', 'dd/MM/yyyy HH:mm') : row[14].toString()) : '',
+          updated_at: formatDateTimeGAS(row[14]),
         });
       }
     }
@@ -1475,7 +1493,7 @@ function getStudentsInWeek(monthlyFileId, tabName, login) {
       is_gifted: (row[6] || '').toString().indexOf('🎁') >= 0,
       is_absent: (row[12] || '').toString() === 'Nghỉ',
       attendance_status: row[12] || '',
-      updated_at: row[14] ? (row[14] instanceof Date ? Utilities.formatDate(row[14], 'GMT+7', 'dd/MM/yyyy HH:mm') : row[14].toString()) : '',
+      updated_at: formatDateTimeGAS(row[14]),
     });
   }
 

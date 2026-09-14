@@ -149,16 +149,61 @@ function callApi(method, ...args) {
 }
 
 
+function formatDateTimeDisplay(val) {
+  if (!val) return '';
+  if (val instanceof Date) {
+    if (isNaN(val.getTime())) return '';
+    const dd = ('0' + val.getDate()).slice(-2);
+    const mm = ('0' + (val.getMonth() + 1)).slice(-2);
+    const yyyy = val.getFullYear();
+    const hh = ('0' + val.getHours()).slice(-2);
+    const min = ('0' + val.getMinutes()).slice(-2);
+    return dd + '/' + mm + '/' + yyyy + ' ' + hh + ':' + min;
+  }
+  const str = String(val).trim();
+  if (!str) return '';
+
+  const dmMatch = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{1,2})(?::\d{1,2})?$/);
+  if (dmMatch) {
+    const dd = ('0' + dmMatch[1]).slice(-2);
+    const mm = ('0' + dmMatch[2]).slice(-2);
+    const yyyy = dmMatch[3];
+    const hh = ('0' + dmMatch[4]).slice(-2);
+    const min = ('0' + dmMatch[5]).slice(-2);
+    return dd + '/' + mm + '/' + yyyy + ' ' + hh + ':' + min;
+  }
+
+  const cleaned = str.replace(/\s*\([^)]*\)$/, '');
+  const d = new Date(cleaned);
+  if (!isNaN(d.getTime())) {
+    const dd = ('0' + d.getDate()).slice(-2);
+    const mm = ('0' + (d.getMonth() + 1)).slice(-2);
+    const yyyy = d.getFullYear();
+    const hh = ('0' + d.getHours()).slice(-2);
+    const min = ('0' + d.getMinutes()).slice(-2);
+    return dd + '/' + mm + '/' + yyyy + ' ' + hh + ':' + min;
+  }
+
+  return str;
+}
+
 function parseVNDateTime(str) {
   if (!str) return null;
-  const parts = str.trim().split(/[\s/:]+/);
-  if (parts.length < 5) return null;
-  const day = parseInt(parts[0], 10);
-  const month = parseInt(parts[1], 10) - 1;
-  const year = parseInt(parts[2], 10);
-  const hour = parseInt(parts[3], 10);
-  const minute = parseInt(parts[4], 10);
-  return new Date(year, month, day, hour, minute);
+  if (str instanceof Date) return isNaN(str.getTime()) ? null : str;
+  const s = String(str).trim();
+  const dmMatch = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{1,2})/);
+  if (dmMatch) {
+    const day = parseInt(dmMatch[1], 10);
+    const month = parseInt(dmMatch[2], 10) - 1;
+    const year = parseInt(dmMatch[3], 10);
+    const hour = parseInt(dmMatch[4], 10);
+    const minute = parseInt(dmMatch[5], 10);
+    return new Date(year, month, day, hour, minute);
+  }
+  const cleaned = s.replace(/\s*\([^)]*\)$/, '');
+  const d = new Date(cleaned);
+  if (!isNaN(d.getTime())) return d;
+  return null;
 }
 
 function parseScore(raw) {
@@ -507,23 +552,8 @@ function App() {
                 const actv = cls.students.filter(s => !s.is_absent);
                 const done = actv.filter(s => s.feedback_text && String(s.feedback_text).trim()).length;
                 const totalClass = actv.length;
-                const deadlineTs = deadlines[cls.class_code];
-                const countdown = deadlineTs ? formatCountdown(deadlineTs - nowTick) : null;
                 const allDone = totalClass > 0 && done === totalClass;
                 
-                let isLate = false;
-                if (allDone && deadlineTs) {
-                  for (const s of cls.students) {
-                    if (s.is_absent) continue;
-                    if (!s.feedback_text || !s.feedback_text.trim()) continue;
-                    if (!s.updated_at) continue;
-                    const updateTime = parseVNDateTime(s.updated_at);
-                    if (updateTime && updateTime.getTime() > deadlineTs) {
-                      isLate = true;
-                      break;
-                    }
-                  }
-                }
                 return (
                   <section key={cls.class_code} className="fade-up" style={{animationDelay:`${i*60}ms`}}>
                     <div className="flex items-center gap-3 mb-3 flex-wrap">
@@ -532,13 +562,6 @@ function App() {
                         {sched && <p className="text-xs font-mono text-[var(--muted)]">{sched.level} · {sched.day1} {sched.time1} – {sched.day2} {sched.time2}</p>}
                       </div>
                       <span className={`chip ${allDone?'chip-good':'chip-warn'}`}>{done}/{totalClass} đã NX</span>
-                      {countdown && !allDone && (
-                        <span className={`chip ${countdown.cls}`} title={deadlineTs?'Deadline: '+new Date(deadlineTs).toLocaleString('vi-VN'):''}>
-                          {countdown.text}
-                        </span>
-                      )}
-                      {allDone && isLate && <span className="chip chip-warn">⚠ Hoàn thành muộn</span>}
-                      {allDone && !isLate && <span className="chip chip-good">✓ Hoàn thành đúng hạn</span>}
                     </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                       {cls.students.map(s => {
@@ -573,10 +596,10 @@ function App() {
                                   <span className={`chip ${b2.cls}`}>{b2.text}</span>
                                 </div>
                               </div>
-                            {s.status && (
+                            {(s.status || s.updated_at) && (
                               <div className="mt-3 pt-3 border-t border-dashed border-[var(--line)] text-xs font-mono text-[var(--muted)] flex justify-between items-center flex-wrap gap-1">
-                                <span>Đánh giá: <span className="text-[var(--ink)] font-medium">{s.status}</span></span>
-                                {s.updated_at && <span style={{fontSize: '9px'}} className="text-[var(--muted)] font-mono">🕒 {s.updated_at}</span>}
+                                <span>{s.status ? <>Đánh giá: <span className="text-[var(--ink)] font-medium">{s.status}</span></> : <span></span>}</span>
+                                {s.updated_at && <span style={{fontSize: '11px'}} className="text-[var(--muted)] font-mono">🕒 {formatDateTimeDisplay(s.updated_at)}</span>}
                               </div>
                             )}
                           </button>
@@ -744,7 +767,7 @@ function App() {
           onClose={() => setSelected(null)}
           onSaved={(updatedFields) => {
             setStudents(prev => prev.map(s => 
-              s.rowIndex === selected.rowIndex ? { ...s, ...updatedFields } : s
+              (s.rowIndex === selected.rowIndex || s.student_id === selected.student_id) ? { ...s, ...updatedFields } : s
             ));
             setSelected(null);
             setToast('✓ Đã lưu vào Google Sheet');
@@ -866,13 +889,17 @@ ${note}`;
     const result = await callApi('saveFeedback', fileId, tab, student.rowIndex, note, generateParent(), teacherLogin, scoreB1, scoreB2, statusEvaluation, student.student_id);
     setSaving(false);
     if (result.error) alert('Lỗi: ' + result.error);
-    else onSaved({
-      feedback_text: note,
-      score_b1: scoreB1,
-      score_b2: scoreB2,
-      status: statusEvaluation,
-      updated_at: result.updated_at
-    });
+    else {
+      const nowFormatted = formatDateTimeDisplay(new Date());
+      const savedTime = (result && result.updated_at) ? formatDateTimeDisplay(result.updated_at) : nowFormatted;
+      onSaved({
+        feedback_text: note,
+        score_b1: scoreB1,
+        score_b2: scoreB2,
+        status: statusEvaluation,
+        updated_at: savedTime
+      });
+    }
   };
 
   const copyParent = async () => {
@@ -898,7 +925,7 @@ ${note}`;
               <h2 className="font-display font-semibold text-2xl mt-1">{student.full_name}</h2>
               <p className="text-xs font-mono text-[var(--muted)] mt-2">
                 ID: {student.student_id} · Bắt đầu: {student.start_date}
-                {student.updated_at && ` · Cập nhật: ${student.updated_at}`}
+                {student.updated_at && ` · Cập nhật: ${formatDateTimeDisplay(student.updated_at)}`}
               </p>
             </div>
             <button onClick={onClose} className="w-9 h-9 rounded-md ghost-btn grid place-items-center text-xl font-light">×</button>
