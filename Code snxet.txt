@@ -1528,13 +1528,32 @@ function saveFeedback(monthlyFileId, tabName, rowIndex, feedbackText, parentTemp
   if (lastRow < 2) return { error: 'Sheet không có dữ liệu học sinh' };
 
   let targetRow = rowIndex;
-  if (targetRow < 2 || targetRow > lastRow) {
-    targetRow = -1;
+  let isMatched = false;
+  const currentTeacherLogin = teacher.login.trim().toLowerCase();
+
+  // ── FAST PATH: Kiểm tra nhanh targetRow trước ──────────────
+  if (targetRow >= 2 && targetRow <= lastRow) {
+    const checkData = sheet.getRange(targetRow, 2, 1, 5).getValues()[0]; // Cột B (ID) đến F (GV)
+    const rowStudentId = (checkData[0] || '').toString().trim();
+    if (!studentId || rowStudentId === studentId.toString().trim()) {
+      isMatched = true;
+      const teacherInRow = (checkData[4] || '').toString().trim().toLowerCase();
+      const isOwner = teacherInRow === currentTeacherLogin || !teacherInRow;
+      if (!isOwner) {
+        const classCode = (checkData[3] || '').toString().trim();
+        const schedules = loadClassSchedules();
+        const sched = schedules[normalizeClassCode(classCode)];
+        const isClassTeacher = sched && sched.teacher_login && sched.teacher_login.toLowerCase() === currentTeacherLogin;
+        if (!isClassTeacher) {
+          return { error: 'Bạn không có quyền sửa dòng này (phân công cho ' + teacherInRow + ').' };
+        }
+      }
+    }
   }
 
-  // Đảm bảo không ghi lệch dòng do có chèn/xóa dòng ở Sheets
-  if (studentId) {
-    const idRange = sheet.getRange(1, 2, lastRow, 4).getValues(); // Cột B (ID) đến E (Mã lớp)
+  // ── FALLBACK: Chỉ khi targetRow bị lệch do chèn/xóa dòng mới quét cột B ──
+  if (!isMatched && studentId) {
+    const idRange = sheet.getRange(1, 2, lastRow, 1).getValues(); // Chỉ đọc 1 cột B (ID)
     let matchedIndex = -1;
     for (let i = 1; i < idRange.length; i++) {
       if (idRange[i][0] && idRange[i][0].toString().trim() === studentId.toString().trim()) {
@@ -1544,42 +1563,35 @@ function saveFeedback(monthlyFileId, tabName, rowIndex, feedbackText, parentTemp
     }
     if (matchedIndex !== -1) {
       targetRow = matchedIndex;
-    } else if (targetRow === -1) {
+      const checkData = sheet.getRange(targetRow, 2, 1, 5).getValues()[0];
+      const teacherInRow = (checkData[4] || '').toString().trim().toLowerCase();
+      const isOwner = teacherInRow === currentTeacherLogin || !teacherInRow;
+      if (!isOwner) {
+        const classCode = (checkData[3] || '').toString().trim();
+        const schedules = loadClassSchedules();
+        const sched = schedules[normalizeClassCode(classCode)];
+        const isClassTeacher = sched && sched.teacher_login && sched.teacher_login.toLowerCase() === currentTeacherLogin;
+        if (!isClassTeacher) {
+          return { error: 'Bạn không có quyền sửa dòng này (phân công cho ' + teacherInRow + ').' };
+        }
+      }
+    } else {
       return { error: 'Không tìm thấy học sinh với ID ' + studentId + ' trong tab ' + tabName };
-    }
-  }
-
-  const checkData = sheet.getRange(targetRow, 2, 1, 5).getValues()[0];
-  const teacherInRow = (checkData[4] || '').toString().trim().toLowerCase();
-  const currentTeacherLogin = teacher.login.trim().toLowerCase();
-
-  // Kiểm tra quyền: Cho phép nếu là GV phụ trách dòng, hoặc GV trong hệ thống
-  const isOwner = teacherInRow === currentTeacherLogin || !teacherInRow;
-  if (!isOwner) {
-    const classCode = (checkData[3] || '').toString().trim();
-    const schedules = loadClassSchedules();
-    const sched = schedules[normalizeClassCode(classCode)];
-    const isClassTeacher = sched && sched.teacher_login && sched.teacher_login.toLowerCase() === currentTeacherLogin;
-    if (!isClassTeacher) {
-      return { error: 'Bạn không có quyền sửa dòng này (phân công cho ' + teacherInRow + ').' };
     }
   }
 
   const updatedAt = Utilities.formatDate(new Date(), 'GMT+7', 'dd/MM/yyyy HH:mm');
   
-  // Đọc và ghi hàng hiện tại từ cột 8 đến 15 (8 cột: H, I, J, K, L, M, N, O) trong 1 lần gọi (Batch write siêu nhanh)
-  const currentRange = sheet.getRange(targetRow, 8, 1, 8);
-  const currentVals = currentRange.getValues()[0];
-  currentVals[0] = statusEvaluation || '';
-  currentVals[1] = scoreB1 || '';
-  currentVals[2] = scoreB2 || '';
-  currentVals[3] = feedbackText || '';
-  currentVals[4] = parentTemplate || '';
-  // currentVals[5] (M - Trạng thái điểm danh) giữ nguyên
-  // currentVals[6] (N - PIC GVCN) giữ nguyên
-  currentVals[7] = updatedAt;
+  // ── GHI TRỰC TIẾP: Cột H-L (8-12) và cột O (15), không đọc trước (Tối ưu 100% I/O) ──
+  sheet.getRange(targetRow, 8, 1, 5).setValues([[
+    statusEvaluation || '',
+    scoreB1 || '',
+    scoreB2 || '',
+    feedbackText || '',
+    parentTemplate || ''
+  ]]);
+  sheet.getRange(targetRow, 15, 1, 1).setValue(updatedAt);
   
-  currentRange.setValues([currentVals]);
   return { ok: true, updated_at: updatedAt };
 }
 
@@ -3064,17 +3076,32 @@ function saveMonthlyReport(monthlyFileId, rowIndex, payload, login, studentId) {
   const tab = ss.getSheetByName('Monthly');
   if (!tab) return { error: 'Không tìm thấy tab Monthly' };
 
-  // Đọc A đến E (cột 1 đến 5)
-  let checkData = tab.getRange(rowIndex, 1, 1, 5).getValues()[0];
-  let rowStudentId = (checkData[0] || '').toString();
-  let teacherInRow = (checkData[4] || '').toString().toLowerCase();
+  const lastRow = tab.getLastRow();
+  if (lastRow < 2) return { error: 'Sheet không có dữ liệu học sinh' };
 
-  // Đảm bảo không ghi lệch dòng
-  if (studentId && rowStudentId !== studentId.toString()) {
-    const allStudentIds = tab.getRange(1, 1, tab.getLastRow(), 1).getValues();
+  let targetRow = rowIndex;
+  let isMatched = false;
+  const currentTeacherLogin = teacher.login.trim().toLowerCase();
+
+  // ── FAST PATH: Kiểm tra nhanh targetRow trước ──────────────
+  if (targetRow >= 2 && targetRow <= lastRow) {
+    const checkData = tab.getRange(targetRow, 1, 1, 5).getValues()[0];
+    const rowStudentId = (checkData[0] || '').toString().trim();
+    if (!studentId || rowStudentId === studentId.toString().trim()) {
+      isMatched = true;
+      const teacherInRow = (checkData[4] || '').toString().trim().toLowerCase();
+      if (teacherInRow && teacherInRow !== currentTeacherLogin) {
+        return { error: 'Bạn không có quyền sửa dòng này' };
+      }
+    }
+  }
+
+  // ── FALLBACK: Chỉ khi targetRow bị lệch do chèn/xóa dòng mới quét cột A ──
+  if (!isMatched && studentId) {
+    const allStudentIds = tab.getRange(1, 1, lastRow, 1).getValues();
     let foundIndex = -1;
     for (let i = 1; i < allStudentIds.length; i++) {
-      if (allStudentIds[i][0].toString() === studentId.toString()) {
+      if (allStudentIds[i][0] && allStudentIds[i][0].toString().trim() === studentId.toString().trim()) {
         foundIndex = i + 1;
         break;
       }
@@ -3082,18 +3109,17 @@ function saveMonthlyReport(monthlyFileId, rowIndex, payload, login, studentId) {
     if (foundIndex === -1) {
       return { error: 'Không tìm thấy học sinh với ID ' + studentId + ' trong tab Monthly' };
     }
-    rowIndex = foundIndex;
-    checkData = tab.getRange(rowIndex, 1, 1, 5).getValues()[0];
-    rowStudentId = (checkData[0] || '').toString();
-    teacherInRow = (checkData[4] || '').toString().toLowerCase();
-  }
-
-  if (teacherInRow !== teacher.login.toLowerCase()) {
-    return { error: 'Bạn không có quyền sửa dòng này' };
+    targetRow = foundIndex;
+    const checkData = tab.getRange(targetRow, 1, 1, 5).getValues()[0];
+    const teacherInRow = (checkData[4] || '').toString().trim().toLowerCase();
+    if (teacherInRow && teacherInRow !== currentTeacherLogin) {
+      return { error: 'Bạn không có quyền sửa dòng này' };
+    }
   }
 
   const updatedAt = Utilities.formatDate(new Date(), 'GMT+7', 'dd/MM/yyyy HH:mm');
-  tab.getRange(rowIndex, 6, 1, 11).setValues([[
+  // ── Ghi 9 cột nhận xét (F-N: 6-14) và cột Cập nhật lúc (P: 16), giữ nguyên cột Word (O: 15) ──
+  tab.getRange(targetRow, 6, 1, 9).setValues([[
     payload.diem_dat_duoc || '',
     payload.kt_dat || '',
     payload.kt_caithien || '',
@@ -3103,10 +3129,9 @@ function saveMonthlyReport(monthlyFileId, rowIndex, payload, login, studentId) {
     payload.td_caithien || '',
     payload.khac_phuc || '',
     payload.giai_phap || '',
-    '',
-    updatedAt,
   ]]);
-  return { ok: true };
+  tab.getRange(targetRow, 16, 1, 1).setValue(updatedAt);
+  return { ok: true, updated_at: updatedAt };
 }
 
 /**

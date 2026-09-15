@@ -148,6 +148,239 @@ function callApi(method, ...args) {
   });
 }
 
+// ── Auto Draft Storage ──────────────────────────────────────
+function saveDraft(key, data) {
+  try { sessionStorage.setItem('draft_' + key, JSON.stringify(data)); } catch(e) {}
+}
+function getDraft(key) {
+  try {
+    const raw = sessionStorage.getItem('draft_' + key);
+    return raw ? JSON.parse(raw) : null;
+  } catch(e) { return null; }
+}
+function clearDraft(key) {
+  try { sessionStorage.removeItem('draft_' + key); } catch(e) {}
+}
+
+// ── Background Sync Queue Manager ────────────────────────────
+class SyncQueueManager {
+  constructor() {
+    this.queue = [];
+    this.listeners = new Set();
+    this.isProcessing = false;
+    this.status = 'idle'; // 'idle' | 'syncing' | 'error' | 'offline'
+    this.lastError = null;
+    this.loadQueue();
+
+    window.addEventListener('online', () => {
+      this.status = 'idle';
+      this.notify();
+      this.process();
+    });
+    window.addEventListener('offline', () => {
+      this.status = 'offline';
+      this.notify();
+    });
+  }
+
+  loadQueue() {
+    try {
+      const raw = localStorage.getItem('snx_sync_queue');
+      if (raw) {
+        this.queue = JSON.parse(raw) || [];
+      }
+    } catch(e) {
+      this.queue = [];
+    }
+  }
+
+  saveQueue() {
+    try {
+      localStorage.setItem('snx_sync_queue', JSON.stringify(this.queue));
+    } catch(e) {}
+  }
+
+  subscribe(listener) {
+    this.listeners.add(listener);
+    listener({ status: this.status, count: this.queue.length, lastError: this.lastError });
+    return () => this.listeners.delete(listener);
+  }
+
+  notify() {
+    this.listeners.forEach(fn => fn({
+      status: this.status,
+      count: this.queue.length,
+      lastError: this.lastError
+    }));
+  }
+
+  enqueueFeedback(payload) {
+    const existingIdx = this.queue.findIndex(item =>
+      item.type === 'feedback' &&
+      item.studentId === payload.studentId &&
+      item.tab === payload.tab &&
+      item.fileId === payload.fileId
+    );
+
+    const task = {
+      id: 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+      type: 'feedback',
+      ...payload,
+      retryCount: 0,
+      createdAt: Date.now()
+    };
+
+    if (existingIdx >= 0) {
+      this.queue[existingIdx] = task;
+    } else {
+      this.queue.push(task);
+    }
+    this.saveQueue();
+    this.notify();
+    this.process();
+  }
+
+  enqueueMonthly(payload) {
+    const existingIdx = this.queue.findIndex(item =>
+      item.type === 'monthly' &&
+      item.studentId === payload.studentId &&
+      item.fileId === payload.fileId
+    );
+
+    const task = {
+      id: 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+      type: 'monthly',
+      ...payload,
+      retryCount: 0,
+      createdAt: Date.now()
+    };
+
+    if (existingIdx >= 0) {
+      this.queue[existingIdx] = task;
+    } else {
+      this.queue.push(task);
+    }
+    this.saveQueue();
+    this.notify();
+    this.process();
+  }
+
+  async process() {
+    if (this.isProcessing || this.queue.length === 0) return;
+    if (!navigator.onLine) {
+      this.status = 'offline';
+      this.notify();
+      return;
+    }
+
+    this.isProcessing = true;
+    this.status = 'syncing';
+    this.notify();
+
+    while (this.queue.length > 0) {
+      const task = this.queue[0];
+      try {
+        if (task.type === 'feedback') {
+          await callApi(
+            'saveFeedback',
+            task.fileId,
+            task.tab,
+            task.rowIndex,
+            task.note,
+            task.parentTemplate,
+            task.teacherLogin,
+            task.scoreB1,
+            task.scoreB2,
+            task.statusEvaluation,
+            task.studentId
+          );
+        } else if (task.type === 'monthly') {
+          await callApi(
+            'saveMonthlyReport',
+            task.fileId,
+            task.rowIndex,
+            task.fields,
+            task.teacherLogin,
+            task.studentId
+          );
+        }
+
+        this.queue.shift();
+        this.saveQueue();
+        this.lastError = null;
+        this.notify();
+      } catch (err) {
+        console.error('Lỗi khi đồng bộ ngầm:', err);
+        task.retryCount = (task.retryCount || 0) + 1;
+        if (task.retryCount >= 3) {
+          this.status = 'error';
+          this.lastError = err.message || 'Lỗi kết nối khi đồng bộ';
+          this.notify();
+          this.isProcessing = false;
+          return;
+        }
+        await new Promise(r => setTimeout(r, 2500));
+      }
+    }
+
+    this.isProcessing = false;
+    this.status = 'idle';
+    this.notify();
+  }
+
+  retryNow() {
+    if (this.queue.length > 0) {
+      this.queue.forEach(t => { t.retryCount = 0; });
+      this.status = 'idle';
+      this.lastError = null;
+      this.notify();
+      this.process();
+    }
+  }
+}
+
+const syncQueue = new SyncQueueManager();
+
+function SyncStatusBadge() {
+  const [syncState, setSyncState] = useState({ status: 'idle', count: 0, lastError: null });
+
+  useEffect(() => {
+    return syncQueue.subscribe(setSyncState);
+  }, []);
+
+  if (syncState.status === 'syncing' || syncState.count > 0) {
+    return (
+      <div className="flex items-center gap-2 px-3 py-1 bg-[#4fb1b8]/10 border border-[#4fb1b8]/30 text-[#133849] rounded-full text-xs font-mono animate-pulse">
+        <span className="inline-block w-2 h-2 rounded-full bg-[#4fb1b8]"></span>
+        <span>🔄 Đang lưu ({syncState.count})...</span>
+      </div>
+    );
+  }
+
+  if (syncState.status === 'offline') {
+    return (
+      <div className="flex items-center gap-1.5 px-3 py-1 bg-amber-50 border border-amber-300 text-amber-900 rounded-full text-xs font-mono" title="Dữ liệu đã lưu trên trình duyệt, sẽ tự động đồng bộ khi có mạng">
+        <span>⚠️ Ngoại tuyến ({syncState.count})</span>
+      </div>
+    );
+  }
+
+  if (syncState.status === 'error') {
+    return (
+      <button onClick={() => syncQueue.retryNow()} className="flex items-center gap-1.5 px-3 py-1 bg-rose-50 border border-rose-300 text-rose-900 rounded-full text-xs font-mono hover:bg-rose-100 transition-colors cursor-pointer" title="Bấm để thử đồng bộ lại">
+        <span>⚠️ Chưa đồng bộ ({syncState.count}) · Thử lại ↻</span>
+      </button>
+    );
+  }
+
+  return (
+    <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-0.5 bg-emerald-50/70 border border-emerald-300/70 text-emerald-800 rounded-full text-[11px] font-mono">
+      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+      <span>Đã đồng bộ</span>
+    </div>
+  );
+}
+
 
 function formatDateTimeDisplay(val) {
   if (!val) return '';
@@ -483,6 +716,7 @@ function App() {
             </div>
           </div>
           <div className="flex items-center gap-4">
+            <SyncStatusBadge />
             {fileInfo && (
               <a href={fileInfo.url} target="_blank" className="text-xs font-mono text-[var(--accent)] hover:underline">📁 Mở Sheet ↗</a>
             )}
@@ -768,50 +1002,69 @@ function App() {
       </main>
 
       {/* ── Panel nhận xét tuần */}
-      {selected && (
-        <DetailPanel
-          key={selected.student_id + '_' + selected.rowIndex}
-          student={selected}
-          fileId={activeWeekFileId || (fileInfo && fileInfo.id)}  // ← THAY ĐỔI: dùng activeWeekFileId
-          tab={activeWeek}
-          currentMonth={currentMonth}
-          currentYear={currentYear}
-          teacherLogin={teacher.login}
-          onClose={() => setSelected(null)}
-          onSaved={(updatedFields) => {
-            setStudents(prev => prev.map(s => 
-              (s.rowIndex === selected.rowIndex || s.student_id === selected.student_id) ? { ...s, ...updatedFields } : s
-            ));
-            setSelected(null);
-            setToast('✓ Đã lưu vào Google Sheet');
-            setTimeout(() => setToast(null), 2500);
-          }}
-        />
-      )}
+      {selected && (() => {
+        const classStudents = students.filter(s => s.class_code === selected.class_code);
+        return (
+          <DetailPanel
+            key={selected.student_id + '_' + selected.rowIndex}
+            student={selected}
+            classStudents={classStudents}
+            fileId={activeWeekFileId || (fileInfo && fileInfo.id)}
+            tab={activeWeek}
+            currentMonth={currentMonth}
+            currentYear={currentYear}
+            teacherLogin={teacher.login}
+            onClose={() => setSelected(null)}
+            onSelectStudent={(nextSt) => setSelected(nextSt)}
+            onSaved={(updatedFields, nextSt) => {
+              setStudents(prev => prev.map(s => 
+                (s.rowIndex === updatedFields.rowIndex || s.student_id === updatedFields.student_id) ? { ...s, ...updatedFields } : s
+              ));
+              if (nextSt) {
+                setSelected(nextSt);
+                setToast(`✓ Đã lưu ${updatedFields.full_name || selected.full_name} · Sang ${nextSt.full_name}`);
+              } else {
+                setSelected(null);
+                setToast('✓ Đã lưu nhận xét');
+              }
+              setTimeout(() => setToast(null), 2500);
+            }}
+          />
+        );
+      })()}
 
       {/* ── Panel báo cáo tháng */}
-      {/* ── THAY ĐỔI: dùng student.fileId từ mỗi student object thay vì monthlyFile.id chung */}
-      {selectedMonthly && (
-        <MonthlyDetailPanel
-          key={selectedMonthly.student_id + '_' + selectedMonthly.fileId}
-          student={selectedMonthly}
-          fileId={selectedMonthly.fileId}          // ← fileId của file tháng tương ứng
-          currentMonth={selectedMonthly.month}     // ← month của student đó (T hoặc T-1)
-          currentYear={selectedMonthly.year}
-          teacherLogin={teacher.login}
-          onClose={() => setSelectedMonthly(null)}
-          onSaved={(updatedFields) => {
-            setMonthlyStudents(prev => prev.map(s => 
-              (s.rowIndex === selectedMonthly.rowIndex && s.fileId === selectedMonthly.fileId) 
-                ? { ...s, ...updatedFields } 
-                : s
-            ));
-            setSelectedMonthly(null);
-            setToast('✓ Đã lưu báo cáo tháng');
-            setTimeout(() => setToast(null), 2500);
-          }}
-        />
-      )}
+      {selectedMonthly && (() => {
+        const classMonthlyStudents = monthlyStudents.filter(s => s.class_code === selectedMonthly.class_code && s.fileId === selectedMonthly.fileId);
+        return (
+          <MonthlyDetailPanel
+            key={selectedMonthly.student_id + '_' + selectedMonthly.fileId}
+            student={selectedMonthly}
+            classStudents={classMonthlyStudents}
+            fileId={selectedMonthly.fileId}
+            currentMonth={selectedMonthly.month}
+            currentYear={selectedMonthly.year}
+            teacherLogin={teacher.login}
+            onClose={() => setSelectedMonthly(null)}
+            onSelectStudent={(nextSt) => setSelectedMonthly(nextSt)}
+            onSaved={(updatedFields, nextSt) => {
+              setMonthlyStudents(prev => prev.map(s => 
+                (s.rowIndex === updatedFields.rowIndex && s.fileId === updatedFields.fileId) 
+                  ? { ...s, ...updatedFields } 
+                  : s
+              ));
+              if (nextSt) {
+                setSelectedMonthly(nextSt);
+                setToast(`✓ Đã lưu ${updatedFields.full_name || selectedMonthly.full_name} · Sang ${nextSt.full_name}`);
+              } else {
+                setSelectedMonthly(null);
+                setToast('✓ Đã lưu báo cáo tháng');
+              }
+              setTimeout(() => setToast(null), 2500);
+            }}
+          />
+        );
+      })()}
 
       {toast && <div className="toast">{toast}</div>}
     </div>
@@ -819,7 +1072,7 @@ function App() {
 }
 
 // ── Detail panel nhận xét tuần ─────────────────────────────
-function DetailPanel({ student, fileId, tab, currentMonth, currentYear, teacherLogin, onClose, onSaved }) {
+function DetailPanel({ student, classStudents, fileId, tab, currentMonth, currentYear, teacherLogin, onClose, onSaved, onSelectStudent }) {
   const [view, setView] = useState('write');
   const [note, setNote] = useState(student.feedback_text != null ? String(student.feedback_text) : '');
   const [scoreB1, setScoreB1] = useState(student.score_b1 != null ? normalizeScore(student.score_b1) : '');
@@ -827,9 +1080,42 @@ function DetailPanel({ student, fileId, tab, currentMonth, currentYear, teacherL
   const [statusEvaluation, setStatusEvaluation] = useState(student.status != null ? String(student.status) : '');
   const [suggestion, setSuggestion] = useState('');
   const [loadingAi, setLoadingAi] = useState(false);
-  const [saving, setSaving] = useState(false);
   const [copied, setCopied] = useState(false);
   const [history, setHistory] = useState([]);
+  const [draftNotice, setDraftNotice] = useState(false);
+
+  const draftKey = `fb_${tab}_${student.student_id}`;
+
+  // Khôi phục bản nháp nếu có
+  useEffect(() => {
+    const draft = getDraft(draftKey);
+    if (draft) {
+      if (draft.note !== undefined && !student.feedback_text) setNote(draft.note);
+      if (draft.scoreB1 !== undefined && !student.score_b1) setScoreB1(draft.scoreB1);
+      if (draft.scoreB2 !== undefined && !student.score_b2) setScoreB2(draft.scoreB2);
+      if (draft.statusEvaluation !== undefined && !student.status) setStatusEvaluation(draft.statusEvaluation);
+      setDraftNotice(true);
+      setTimeout(() => setDraftNotice(false), 3000);
+    }
+  }, [student.student_id, tab]);
+
+  // Tự động lưu bản nháp khi gõ
+  const handleNoteChange = (v) => {
+    setNote(v);
+    saveDraft(draftKey, { note: v, scoreB1, scoreB2, statusEvaluation });
+  };
+  const handleScoreB1Change = (v) => {
+    setScoreB1(v);
+    saveDraft(draftKey, { note, scoreB1: v, scoreB2, statusEvaluation });
+  };
+  const handleScoreB2Change = (v) => {
+    setScoreB2(v);
+    saveDraft(draftKey, { note, scoreB1, scoreB2: v, statusEvaluation });
+  };
+  const handleStatusChange = (v) => {
+    setStatusEvaluation(v);
+    saveDraft(draftKey, { note, scoreB1, scoreB2, statusEvaluation: v });
+  };
 
   const baseOptions = [];
   for (let i = 10; i >= 0; i -= 0.5) {
@@ -848,7 +1134,6 @@ function DetailPanel({ student, fileId, tab, currentMonth, currentYear, teacherL
   }
 
   useEffect(() => {
-    // ── THAY ĐỔI: getStudentHistory đã cập nhật backend để trả về cả T và T-1
     callApi('getStudentHistory', student.student_id, currentMonth, currentYear, teacherLogin).then(d => {
       if (d.history) setHistory(d.history);
     });
@@ -878,7 +1163,13 @@ Giáo viên chủ nhiệm: ${student.teacher_login}.
 Nhận xét của thầy cô:
 ${note}`;
 
-  const handleSave = async () => {
+  const classList = classStudents || [];
+  const currentIndex = classList.findIndex(s => s.student_id === student.student_id && s.rowIndex === student.rowIndex);
+  const totalInClass = classList.length;
+  const prevStudent = currentIndex > 0 ? classList[currentIndex - 1] : null;
+  const nextStudent = (currentIndex >= 0 && currentIndex < totalInClass - 1) ? classList[currentIndex + 1] : null;
+
+  const doSave = (andNext = false) => {
     const missingFields = [];
     if (!student.is_absent) {
       if (!statusEvaluation || !statusEvaluation.trim()) missingFields.push("Đánh giá chung");
@@ -897,21 +1188,43 @@ ${note}`;
       alert("Không thể lưu! Vui lòng điền đầy đủ các trường:\n• " + missingFields.join("\n• "));
       return;
     }
-    setSaving(true);
-    // fileId truyền vào đây đã là activeWeekFileId (đúng file dù tuần thuộc T hay T-1), kèm student_id để chống lệch dòng
-    const result = await callApi('saveFeedback', fileId, tab, student.rowIndex, note, generateParent(), teacherLogin, scoreB1, scoreB2, statusEvaluation, student.student_id);
-    setSaving(false);
-    if (result.error) alert('Lỗi: ' + result.error);
-    else {
-      const nowFormatted = formatDateTimeDisplay(new Date());
-      const savedTime = (result && result.updated_at) ? formatDateTimeDisplay(result.updated_at) : nowFormatted;
-      onSaved({
-        feedback_text: note,
-        score_b1: scoreB1,
-        score_b2: scoreB2,
-        status: statusEvaluation,
-        updated_at: savedTime
-      });
+
+    const nowFormatted = formatDateTimeDisplay(new Date());
+    const parentMsg = generateParent();
+
+    // 1. Xóa draft
+    clearDraft(draftKey);
+
+    // 2. Đẩy vào background sync queue để đồng bộ ngầm
+    syncQueue.enqueueFeedback({
+      fileId: fileId,
+      tab: tab,
+      rowIndex: student.rowIndex,
+      note: note,
+      parentTemplate: parentMsg,
+      teacherLogin: teacherLogin,
+      scoreB1: scoreB1,
+      scoreB2: scoreB2,
+      statusEvaluation: statusEvaluation,
+      studentId: student.student_id
+    });
+
+    // 3. Optimistic Update ngay lập tức (0s wait)
+    const updatedData = {
+      rowIndex: student.rowIndex,
+      student_id: student.student_id,
+      full_name: student.full_name,
+      feedback_text: note,
+      score_b1: scoreB1,
+      score_b2: scoreB2,
+      status: statusEvaluation,
+      updated_at: nowFormatted
+    };
+
+    if (andNext && nextStudent) {
+      onSaved(updatedData, nextStudent);
+    } else {
+      onSaved(updatedData, null);
     }
   };
 
@@ -930,165 +1243,186 @@ ${note}`;
 
   return (
     <div className="fixed inset-0 bg-[var(--ink)]/40 backdrop-blur-sm z-50 flex justify-end fade-up">
-      <div className="bg-[var(--paper)] w-full max-w-2xl h-full overflow-y-auto shadow-2xl">
-        <div className="sticky top-0 bg-[var(--paper)] border-b border-[var(--line)] px-6 py-4 z-10">
-          <div className="flex items-start justify-between gap-4">
-            <div className="flex-1 min-w-0">
-              <p className="text-xs font-mono text-[var(--muted)] uppercase tracking-wider truncate">{student.class_code} · {student.week}</p>
-              <h2 className="font-display font-semibold text-2xl mt-1">{student.full_name}</h2>
-              <p className="text-xs font-mono text-[var(--muted)] mt-2">
-                ID: {student.student_id} · Bắt đầu: {student.start_date}
-                {student.updated_at && ` · Cập nhật: ${formatDateTimeDisplay(student.updated_at)}`}
-              </p>
+      <div className="bg-[var(--paper)] w-full max-w-2xl h-full overflow-y-auto shadow-2xl flex flex-col justify-between">
+        <div>
+          {/* Header Drawer */}
+          <div className="sticky top-0 bg-[var(--paper)] border-b border-[var(--line)] px-6 py-4 z-10">
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <p className="text-xs font-mono text-[var(--muted)] uppercase tracking-wider">{student.class_code} · {student.week}</p>
+                  {draftNotice && <span className="px-2 py-0.5 bg-amber-100 text-amber-800 rounded text-[10px] font-mono">Khôi phục bản nháp</span>}
+                </div>
+                <h2 className="font-display font-semibold text-2xl mt-1">{student.full_name}</h2>
+                <p className="text-xs font-mono text-[var(--muted)] mt-1">
+                  ID: {student.student_id} · Bắt đầu: {student.start_date}
+                  {student.updated_at && ` · Cập nhật: ${formatDateTimeDisplay(student.updated_at)}`}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {totalInClass > 1 && (
+                  <div className="flex items-center bg-[var(--paper-2)] border border-[var(--line)] rounded-md px-2 py-1 text-xs font-mono text-[var(--muted)] gap-1">
+                    <span>{currentIndex + 1}/{totalInClass}</span>
+                    <button onClick={() => prevStudent && onSelectStudent(prevStudent)} disabled={!prevStudent} title="Học sinh trước" className="px-1 font-bold hover:text-[var(--ink)] disabled:opacity-20 cursor-pointer">◀</button>
+                    <button onClick={() => nextStudent && onSelectStudent(nextStudent)} disabled={!nextStudent} title="Học sinh tiếp theo" className="px-1 font-bold hover:text-[var(--ink)] disabled:opacity-20 cursor-pointer">▶</button>
+                  </div>
+                )}
+                <button onClick={onClose} className="w-9 h-9 rounded-md ghost-btn grid place-items-center text-xl font-light">×</button>
+              </div>
             </div>
-            <button onClick={onClose} className="w-9 h-9 rounded-md ghost-btn grid place-items-center text-xl font-light">×</button>
           </div>
-        </div>
 
-        <div className="px-6 pt-4">
-          <div className="flex gap-1 p-1 bg-[var(--paper-2)] rounded-md inline-flex">
-            {[{id:'write',label:'Viết nhận xét'},{id:'history',label:`Lịch sử (${history.length})`}].map(t => (
-              <button key={t.id} onClick={() => setView(t.id)}
-                className={`px-4 py-2 text-sm rounded font-medium ${view===t.id?'bg-[var(--ink)] text-[var(--paper)]':'text-[var(--ink)] hover:bg-black/5'}`}>
-                {t.label}
-              </button>
-            ))}
+          <div className="px-6 pt-4">
+            <div className="flex gap-1 p-1 bg-[var(--paper-2)] rounded-md inline-flex">
+              {[{id:'write',label:'Viết nhận xét'},{id:'history',label:`Lịch sử (${history.length})`}].map(t => (
+                <button key={t.id} onClick={() => setView(t.id)}
+                  className={`px-4 py-2 text-sm rounded font-medium ${view===t.id?'bg-[var(--ink)] text-[var(--paper)]':'text-[var(--ink)] hover:bg-black/5'}`}>
+                  {t.label}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
 
-        <div className="px-6 py-6">
-          {view === 'write' && (
-            <div className="space-y-5 fade-up">
-              {student.is_absent && (
-                <div style={{background:'#F1EFE8',border:'1px solid #B4B2A9',borderRadius:8,padding:'12px 16px',fontSize:13}}>
-                  <strong>HS nghỉ cả tuần</strong> — không bắt buộc viết nhận xét, nhưng vẫn có thể điền điểm BTVN.
-                </div>
-              )}
-              {student.is_gifted && (
-                <div style={{background:'#FAEEDA',border:'1px solid #EF9F27',borderRadius:8,padding:'12px 16px',fontSize:13,color:'#854F0B'}}>
-                  🎁 <strong>HS tặng buổi</strong> — {student.note}
-                </div>
-              )}
-              {student.attendance_status === 'Học đủ (chờ xác nhận B2)' && (
-                <div style={{background:'#EFF6FF',border:'1px solid #BFDBFE',borderRadius:8,padding:'12px 16px',fontSize:13,color:'#1D4ED8'}}>
-                  <strong>Chờ xác nhận buổi 2</strong> — Hệ thống chưa nhận được kết quả điểm danh cuối cùng của buổi 2. Thầy/cô vẫn có thể điền nhận xét tuần ngay bây giờ.
-                </div>
-              )}
-              {student.attendance_status === 'Nghỉ B1 (chờ xác nhận B2)' && (
-                <div style={{background:'#FFFBEB',border:'1px solid #FDE68A',borderRadius:8,padding:'12px 16px',fontSize:13,color:'#92400E'}}>
-                  <strong>Buổi 1 nghỉ · Buổi 2 chờ xác nhận</strong> — Con đã nghỉ buổi 1. Buổi 2 hệ thống chưa nhận được kết quả điểm danh cuối cùng nên có thể con vẫn học đầy đủ. Thầy/cô vẫn có thể điền nhận xét và điểm BTVN buổi 2 ngay bây giờ.
-                </div>
-              )}
-              {student.note && !student.is_gifted && !student.is_absent && (
-                <div style={{background:'rgba(45,106,79,0.08)',border:'1px solid rgba(45,106,79,0.3)',borderRadius:8,padding:'12px 16px',fontSize:13,color:'var(--good)'}}>
-                  <strong>Ghi chú:</strong> {student.note}
-                </div>
-              )}
+          <div className="px-6 py-6">
+            {view === 'write' && (
+              <div className="space-y-5 fade-up">
+                {student.is_absent && (
+                  <div style={{background:'#F1EFE8',border:'1px solid #B4B2A9',borderRadius:8,padding:'12px 16px',fontSize:13}}>
+                    <strong>HS nghỉ cả tuần</strong> — không bắt buộc viết nhận xét, nhưng vẫn có thể điền điểm BTVN.
+                  </div>
+                )}
+                {student.is_gifted && (
+                  <div style={{background:'#FAEEDA',border:'1px solid #EF9F27',borderRadius:8,padding:'12px 16px',fontSize:13,color:'#854F0B'}}>
+                    🎁 <strong>HS tặng buổi</strong> — {student.note}
+                  </div>
+                )}
+                {student.attendance_status === 'Học đủ (chờ xác nhận B2)' && (
+                  <div style={{background:'#EFF6FF',border:'1px solid #BFDBFE',borderRadius:8,padding:'12px 16px',fontSize:13,color:'#1D4ED8'}}>
+                    <strong>Chờ xác nhận buổi 2</strong> — Hệ thống chưa nhận được kết quả điểm danh cuối cùng của buổi 2. Thầy/cô vẫn có thể điền nhận xét tuần ngay bây giờ.
+                  </div>
+                )}
+                {student.attendance_status === 'Nghỉ B1 (chờ xác nhận B2)' && (
+                  <div style={{background:'#FFFBEB',border:'1px solid #FDE68A',borderRadius:8,padding:'12px 16px',fontSize:13,color:'#92400E'}}>
+                    <strong>Buổi 1 nghỉ · Buổi 2 chờ xác nhận</strong> — Con đã nghỉ buổi 1. Buổi 2 hệ thống chưa nhận được kết quả điểm danh cuối cùng nên có thể con vẫn học đầy đủ. Thầy/cô vẫn có thể điền nhận xét và điểm BTVN buổi 2 ngay bây giờ.
+                  </div>
+                )}
+                {student.note && !student.is_gifted && !student.is_absent && (
+                  <div style={{background:'rgba(45,106,79,0.08)',border:'1px solid rgba(45,106,79,0.3)',borderRadius:8,padding:'12px 16px',fontSize:13,color:'var(--good)'}}>
+                    <strong>Ghi chú:</strong> {student.note}
+                  </div>
+                )}
 
-              <div className="paper-card rounded-md p-4 grid grid-cols-3 gap-4">
-                <div>
-                  <label className="text-xs font-mono text-[var(--muted)] uppercase mb-2 block">Đánh giá</label>
-                  <select className="field w-full text-center font-display text-sm font-semibold"
-                    style={{padding:'8px 10px'}}
-                    value={statusEvaluation} onChange={e => setStatusEvaluation(e.target.value)} disabled={student.is_absent}>
-                    <option value="">— Chọn —</option>
-                    <option value="Xuất sắc">Xuất sắc</option>
-                    <option value="Tốt">Tốt</option>
-                    <option value="Đạt">Đạt</option>
-                    <option value="Cần cố gắng">Cần cố gắng</option>
-                  </select>
+                <div className="paper-card rounded-md p-4 grid grid-cols-3 gap-4">
+                  <div>
+                    <label className="text-xs font-mono text-[var(--muted)] uppercase mb-2 block">Đánh giá</label>
+                    <select className="field w-full text-center font-display text-sm font-semibold"
+                      style={{padding:'8px 10px'}}
+                      value={statusEvaluation} onChange={e => handleStatusChange(e.target.value)} disabled={student.is_absent}>
+                      <option value="">— Chọn —</option>
+                      <option value="Xuất sắc">Xuất sắc</option>
+                      <option value="Tốt">Tốt</option>
+                      <option value="Đạt">Đạt</option>
+                      <option value="Cần cố gắng">Cần cố gắng</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-mono text-[var(--muted)] uppercase mb-2 block">BTVN B1</label>
+                    <select className="field w-full text-center font-display text-sm font-semibold"
+                      style={{padding:'8px 10px'}}
+                      value={scoreB1} onChange={e => handleScoreB1Change(e.target.value)}>
+                      <option value="">— Chọn —</option>
+                      {renderedOptionsB1.map(opt => (
+                        <option key={opt} value={opt}>{opt}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-mono text-[var(--muted)] uppercase mb-2 block">BTVN B2</label>
+                    <select className="field w-full text-center font-display text-sm font-semibold"
+                      style={{padding:'8px 10px'}}
+                      value={scoreB2} onChange={e => handleScoreB2Change(e.target.value)}>
+                      <option value="">— Chọn —</option>
+                      {renderedOptionsB2.map(opt => (
+                        <option key={opt} value={opt}>{opt}</option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
-                <div>
-                  <label className="text-xs font-mono text-[var(--muted)] uppercase mb-2 block">BTVN B1</label>
-                  <select className="field w-full text-center font-display text-sm font-semibold"
-                    style={{padding:'8px 10px'}}
-                    value={scoreB1} onChange={e => setScoreB1(e.target.value)}>
-                    <option value="">— Chọn —</option>
-                    {renderedOptionsB1.map(opt => (
-                      <option key={opt} value={opt}>{opt}</option>
-                    ))}
-                  </select>
+
+                <div className="border-l-2 border-[var(--accent)] pl-4 py-1">
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="text-xs font-mono uppercase tracking-wider text-[var(--accent)] font-semibold">Gợi ý từ Claude</span>
+                    {!suggestion && !loadingAi && <button onClick={fetchAi} className="text-xs font-mono text-[var(--accent)] hover:underline">→ tạo gợi ý</button>}
+                  </div>
+                  {loadingAi && <p className="text-sm italic text-[var(--muted)]">Đang phân tích...</p>}
+                  {suggestion && (
+                    <>
+                      <pre className="text-sm italic font-display leading-relaxed whitespace-pre-wrap" style={{fontFamily:'inherit'}}>{suggestion}</pre>
+                      <button onClick={() => handleNoteChange(suggestion)} className="text-xs font-mono text-[var(--accent)] hover:underline mt-2">→ Dùng bản này</button>
+                    </>
+                  )}
                 </div>
+
                 <div>
-                  <label className="text-xs font-mono text-[var(--muted)] uppercase mb-2 block">BTVN B2</label>
-                  <select className="field w-full text-center font-display text-sm font-semibold"
-                    style={{padding:'8px 10px'}}
-                    value={scoreB2} onChange={e => setScoreB2(e.target.value)}>
-                    <option value="">— Chọn —</option>
-                    {renderedOptionsB2.map(opt => (
-                      <option key={opt} value={opt}>{opt}</option>
+                  <div className="text-xs font-mono uppercase tracking-wider text-[var(--muted)] mb-2">Mẫu nhanh</div>
+                  <div className="flex flex-wrap gap-2">
+                    {TEMPLATES.map((t, i) => (
+                      <button key={i} onClick={() => handleNoteChange(note ? note + '\n' + t.text : t.text)}
+                        className="chip hover:bg-[var(--ink)] hover:text-[var(--paper)] hover:border-[var(--ink)] transition-colors">+ {t.tag}</button>
                     ))}
-                  </select>
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="text-xs font-mono uppercase tracking-wider text-[var(--muted)]">Nhận xét chung (buổi 1 + 2)</label>
+                    <span className="text-xs font-mono text-[var(--muted)]">{note.length} ký tự</span>
+                  </div>
+                  <div className="paper-card rounded-md p-4">
+                    <textarea className="notebook min-h-[280px]" placeholder="Bắt đầu viết nhận xét..."
+                      value={note} onChange={e => handleNoteChange(e.target.value)} />
+                  </div>
                 </div>
               </div>
+            )}
 
-              <div className="border-l-2 border-[var(--accent)] pl-4 py-1">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="text-xs font-mono uppercase tracking-wider text-[var(--accent)] font-semibold">Gợi ý từ Claude</span>
-                  {!suggestion && !loadingAi && <button onClick={fetchAi} className="text-xs font-mono text-[var(--accent)] hover:underline">→ tạo gợi ý</button>}
-                </div>
-                {loadingAi && <p className="text-sm italic text-[var(--muted)]">Đang phân tích...</p>}
-                {suggestion && (
-                  <>
-                    <pre className="text-sm italic font-display leading-relaxed whitespace-pre-wrap" style={{fontFamily:'inherit'}}>{suggestion}</pre>
-                    <button onClick={() => setNote(suggestion)} className="text-xs font-mono text-[var(--accent)] hover:underline mt-2">→ Dùng bản này</button>
-                  </>
+            {view === 'history' && (
+              <div className="space-y-4 fade-up">
+                {history.length === 0 ? (
+                  <div className="text-center py-12 text-[var(--muted)] font-mono text-sm">Chưa có dữ liệu các tuần khác</div>
+                ) : (
+                  history.map((h, i) => (
+                    <div key={i} className="paper-card rounded-md p-4">
+                      <div className="flex items-baseline justify-between mb-2 flex-wrap gap-2">
+                        <span className="font-display font-semibold">{h.tab}</span>
+                        <span className="text-xs font-mono text-[var(--muted)]">B1: {h.score_b1 || '—'} · B2: {h.score_b2 || '—'}</span>
+                      </div>
+                      {h.note && <p className="text-xs text-[var(--muted)] italic mb-1">{h.note}</p>}
+                      {h.feedback_text
+                        ? <p className="text-sm leading-relaxed whitespace-pre-line">{h.feedback_text}</p>
+                        : <p className="text-sm italic text-[var(--muted)]">(Chưa có nhận xét)</p>}
+                    </div>
+                  ))
                 )}
               </div>
-
-              <div>
-                <div className="text-xs font-mono uppercase tracking-wider text-[var(--muted)] mb-2">Mẫu nhanh</div>
-                <div className="flex flex-wrap gap-2">
-                  {TEMPLATES.map((t, i) => (
-                    <button key={i} onClick={() => setNote(n => n ? n + '\n' + t.text : t.text)}
-                      className="chip hover:bg-[var(--ink)] hover:text-[var(--paper)] hover:border-[var(--ink)] transition-colors">+ {t.tag}</button>
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <label className="text-xs font-mono uppercase tracking-wider text-[var(--muted)]">Nhận xét chung (buổi 1 + 2)</label>
-                  <span className="text-xs font-mono text-[var(--muted)]">{note.length} ký tự</span>
-                </div>
-                <div className="paper-card rounded-md p-4">
-                  <textarea className="notebook min-h-[280px]" placeholder="Bắt đầu viết nhận xét..."
-                    value={note} onChange={e => setNote(e.target.value)} />
-                </div>
-              </div>
-
-              <div className="flex gap-2 pt-2">
-                <button onClick={copyParent} disabled={!note.trim()} className="ghost-btn px-5 py-2.5 rounded-md text-sm font-medium disabled:opacity-40">
-                  {copied ? '✓ Đã copy' : 'Copy mẫu gửi PH'}
-                </button>
-                <button onClick={handleSave} disabled={saving} className="accent-btn px-5 py-2.5 rounded-md text-sm font-medium flex-1 disabled:opacity-40">
-                  {saving ? 'Đang lưu...' : 'Lưu vào Google Sheet'}
-                </button>
-              </div>
-            </div>
-          )}
-
-          {view === 'history' && (
-            <div className="space-y-4 fade-up">
-              {history.length === 0 ? (
-                <div className="text-center py-12 text-[var(--muted)] font-mono text-sm">Chưa có dữ liệu các tuần khác</div>
-              ) : (
-                history.map((h, i) => (
-                  <div key={i} className="paper-card rounded-md p-4">
-                    <div className="flex items-baseline justify-between mb-2 flex-wrap gap-2">
-                      <span className="font-display font-semibold">{h.tab}</span>
-                      <span className="text-xs font-mono text-[var(--muted)]">B1: {h.score_b1 || '—'} · B2: {h.score_b2 || '—'}</span>
-                    </div>
-                    {h.note && <p className="text-xs text-[var(--muted)] italic mb-1">{h.note}</p>}
-                    {h.feedback_text
-                      ? <p className="text-sm leading-relaxed whitespace-pre-line">{h.feedback_text}</p>
-                      : <p className="text-sm italic text-[var(--muted)]">(Chưa có nhận xét)</p>}
-                  </div>
-                ))
-              )}
-            </div>
-          )}
+            )}
+          </div>
         </div>
+
+        {/* Footer Action Buttons */}
+        {view === 'write' && (
+          <div className="sticky bottom-0 bg-[var(--paper)] border-t border-[var(--line)] px-6 py-4 flex gap-2 items-center">
+            <button onClick={copyParent} disabled={!note.trim()} className="ghost-btn px-4 py-2.5 rounded-md text-sm font-medium disabled:opacity-40" title="Copy mẫu gửi PH">
+              {copied ? '✓ Đã copy' : 'Copy mẫu'}
+            </button>
+            <button onClick={() => doSave(false)} className="ghost-btn px-4 py-2.5 rounded-md text-sm font-medium hover:bg-[var(--accent)] hover:text-white transition-colors" style={{borderColor:'var(--accent)',color:'var(--accent-dark)'}} title="Lưu học sinh này và đóng cửa sổ">
+              💾 Lưu
+            </button>
+            <button onClick={() => doSave(true)} className="ink-btn px-5 py-2.5 rounded-md text-sm font-semibold flex-1 flex items-center justify-center gap-1.5 shadow-md hover:shadow-lg transition-all" title="Lưu học sinh này và mở ngay học sinh tiếp theo trong lớp">
+              <span>{nextStudent ? '💾 Lưu & Tiếp theo ➔' : '💾 Lưu & Hoàn thành ✓'}</span>
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1105,7 +1439,7 @@ function normalizeScore(val) {
 }
 
 // ── Monthly detail panel ────────────────────────────────────
-function MonthlyDetailPanel({ student, fileId, currentMonth, currentYear, teacherLogin, onClose, onSaved }) {
+function MonthlyDetailPanel({ student, classStudents, fileId, currentMonth, currentYear, teacherLogin, onClose, onSaved, onSelectStudent }) {
   const [fields, setFields] = useState({
     diem_dat_duoc: student.diem_dat_duoc != null ? normalizeScore(student.diem_dat_duoc) : '',
     kt_dat:        student.kt_dat        != null ? String(student.kt_dat)        : '',
@@ -1117,10 +1451,19 @@ function MonthlyDetailPanel({ student, fileId, currentMonth, currentYear, teache
     khac_phuc:     student.khac_phuc     != null ? String(student.khac_phuc)     : '',
     giai_phap:     student.giai_phap     != null ? String(student.giai_phap)     : '',
   });
-  const [saving, setSaving] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [loadingAi, setLoadingAi] = useState(false);
   const [aiResult, setAiResult] = useState(null);
+
+  const draftKey = `monthly_${fileId}_${student.student_id}`;
+
+  // Khôi phục bản nháp nếu có
+  useEffect(() => {
+    const draft = getDraft(draftKey);
+    if (draft) {
+      setFields(prev => ({ ...prev, ...draft }));
+    }
+  }, [student.student_id, fileId]);
 
   const scoreOptions = [];
   for (let i = 10; i >= 0; i -= 0.5) {
@@ -1134,19 +1477,46 @@ function MonthlyDetailPanel({ student, fileId, currentMonth, currentYear, teache
     renderedOptions.push(fields.diem_dat_duoc);
   }
 
-  const updateField = (k, v) => setFields(prev => ({ ...prev, [k]: v }));
+  const updateField = (k, v) => {
+    setFields(prev => {
+      const updated = { ...prev, [k]: v };
+      saveDraft(draftKey, updated);
+      return updated;
+    });
+  };
 
-  const handleSave = async () => {
+  const classList = classStudents || [];
+  const currentIndex = classList.findIndex(s => s.student_id === student.student_id && s.rowIndex === student.rowIndex && s.fileId === student.fileId);
+  const totalInClass = classList.length;
+  const prevStudent = currentIndex > 0 ? classList[currentIndex - 1] : null;
+  const nextStudent = (currentIndex >= 0 && currentIndex < totalInClass - 1) ? classList[currentIndex + 1] : null;
+
+  const handleSave = (andNext = false) => {
     if (!fields.diem_dat_duoc || !fields.diem_dat_duoc.trim()) {
       alert("Không thể lưu! Vui lòng điền đầy đủ: Điểm con đạt được");
       return;
     }
-    setSaving(true);
-    // ── THAY ĐỔI: fileId là student.fileId, truyền thêm student_id để chống lệch dòng
-    const result = await callApi('saveMonthlyReport', fileId, student.rowIndex, fields, teacherLogin, student.student_id);
-    setSaving(false);
-    if (result.error) alert('Lỗi: ' + result.error);
-    else onSaved({
+
+    clearDraft(draftKey);
+
+    const nowFormatted = formatDateTimeDisplay(new Date());
+    const isDone = !!(fields.kt_dat || fields.kn_dat || fields.td_dat);
+
+    // 1. Đẩy vào hàng đợi lưu ngầm
+    syncQueue.enqueueMonthly({
+      fileId: fileId,
+      rowIndex: student.rowIndex,
+      fields: fields,
+      teacherLogin: teacherLogin,
+      studentId: student.student_id
+    });
+
+    // 2. Optimistic Update ngay lập tức (0s wait)
+    const updatedData = {
+      rowIndex: student.rowIndex,
+      fileId: student.fileId,
+      student_id: student.student_id,
+      full_name: student.full_name,
       diem_dat_duoc: fields.diem_dat_duoc,
       kt_dat: fields.kt_dat,
       kt_caithien: fields.kt_caithien,
@@ -1156,8 +1526,15 @@ function MonthlyDetailPanel({ student, fileId, currentMonth, currentYear, teache
       td_caithien: fields.td_caithien,
       khac_phuc: fields.khac_phuc,
       giai_phap: fields.giai_phap,
-      is_done: !!(fields.kt_dat || fields.kn_dat || fields.td_dat)
-    });
+      updated_at: nowFormatted,
+      is_done: isDone
+    };
+
+    if (andNext && nextStudent) {
+      onSaved(updatedData, nextStudent);
+    } else {
+      onSaved(updatedData, null);
+    }
   };
 
   const handleExportWord = async () => {
@@ -1171,12 +1548,15 @@ function MonthlyDetailPanel({ student, fileId, currentMonth, currentYear, teache
     }
     setExporting(true);
     await callApi('saveMonthlyReport', fileId, student.rowIndex, fields, teacherLogin, student.student_id);
-    // ── THAY ĐỔI: truyền student.month và student.year và student_id
     const result = await callApi('exportMonthlyReportToWord', fileId, student.rowIndex, teacherLogin, currentMonth, currentYear, student.student_id);
     setExporting(false);
     if (result.error) alert('Lỗi xuất Word: ' + result.error);
     else {
       onSaved({
+        rowIndex: student.rowIndex,
+        fileId: student.fileId,
+        student_id: student.student_id,
+        full_name: student.full_name,
         diem_dat_duoc: fields.diem_dat_duoc,
         kt_dat: fields.kt_dat,
         kt_caithien: fields.kt_caithien,
@@ -1188,14 +1568,13 @@ function MonthlyDetailPanel({ student, fileId, currentMonth, currentYear, teache
         giai_phap: fields.giai_phap,
         word_url: result.url,
         is_done: true
-      });
+      }, null);
       window.open(result.url, '_blank');
     }
   };
 
   const fetchAi = async () => {
     setLoadingAi(true);
-    // ── THAY ĐỔI: truyền đúng month/year của student
     const d = await callApi('getAiMonthlySuggestion', student, currentMonth, currentYear);
     setLoadingAi(false);
     if (d.suggestion && typeof d.suggestion === 'object') setAiResult(d.suggestion);
@@ -1216,93 +1595,105 @@ function MonthlyDetailPanel({ student, fileId, currentMonth, currentYear, teache
 
   return (
     <div className="fixed inset-0 bg-[var(--ink)]/40 backdrop-blur-sm z-50 flex justify-end fade-up">
-      <div className="bg-[var(--paper)] w-full max-w-3xl h-full overflow-y-auto shadow-2xl">
-        <div className="sticky top-0 bg-[var(--paper)] border-b border-[var(--line)] px-6 py-4 z-10">
-          <div className="flex items-start justify-between gap-4">
-            <div className="flex-1 min-w-0">
-              {/* ── THAY ĐỔI: hiển thị đúng tháng của student */}
-              <p className="text-xs font-mono text-[var(--muted)] uppercase tracking-wider truncate">
-                Báo cáo {student.monthLabel} · {student.class_code}
-              </p>
-              <h2 className="font-display font-semibold text-2xl mt-1">{student.full_name}</h2>
-              <p className="text-xs font-mono text-[var(--muted)] mt-2">ID: {student.student_id} · Bắt đầu: {student.start_date}</p>
+      <div className="bg-[var(--paper)] w-full max-w-3xl h-full overflow-y-auto shadow-2xl flex flex-col justify-between">
+        <div>
+          <div className="sticky top-0 bg-[var(--paper)] border-b border-[var(--line)] px-6 py-4 z-10">
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-mono text-[var(--muted)] uppercase tracking-wider truncate">
+                  Báo cáo {student.monthLabel} · {student.class_code}
+                </p>
+                <h2 className="font-display font-semibold text-2xl mt-1">{student.full_name}</h2>
+                <p className="text-xs font-mono text-[var(--muted)] mt-2">ID: {student.student_id} · Bắt đầu: {student.start_date}</p>
+              </div>
+              <div className="flex items-center gap-2">
+                {totalInClass > 1 && (
+                  <div className="flex items-center bg-[var(--paper-2)] border border-[var(--line)] rounded-md px-2 py-1 text-xs font-mono text-[var(--muted)] gap-1">
+                    <span>{currentIndex + 1}/{totalInClass}</span>
+                    <button onClick={() => prevStudent && onSelectStudent(prevStudent)} disabled={!prevStudent} title="Học sinh trước" className="px-1 font-bold hover:text-[var(--ink)] disabled:opacity-20 cursor-pointer">◀</button>
+                    <button onClick={() => nextStudent && onSelectStudent(nextStudent)} disabled={!nextStudent} title="Học sinh tiếp theo" className="px-1 font-bold hover:text-[var(--ink)] disabled:opacity-20 cursor-pointer">▶</button>
+                  </div>
+                )}
+                <button onClick={onClose} className="w-9 h-9 rounded-md ghost-btn grid place-items-center text-xl font-light">×</button>
+              </div>
             </div>
-            <button onClick={onClose} className="w-9 h-9 rounded-md ghost-btn grid place-items-center text-xl font-light">×</button>
           </div>
-        </div>
 
-        <div className="px-6 py-6 space-y-5">
-          <div className="border-l-2 border-[var(--accent)] pl-4 py-1">
-            <div className="flex items-center gap-2 mb-2">
-              <span className="text-xs font-mono uppercase tracking-wider text-[var(--accent)] font-semibold">Gợi ý tổng hợp từ AI</span>
-              {!aiResult && !loadingAi && (
-                <button onClick={fetchAi} className="text-xs font-mono text-[var(--accent)] hover:underline">→ Tạo gợi ý từ data 4 tuần</button>
-              )}
-              {aiResult && (
-                <button onClick={applyAllAi} className="text-xs font-mono text-[var(--accent)] hover:underline">→ Dùng tất cả</button>
-              )}
+          <div className="px-6 py-6 space-y-5">
+            <div className="border-l-2 border-[var(--accent)] pl-4 py-1">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-xs font-mono uppercase tracking-wider text-[var(--accent)] font-semibold">Gợi ý tổng hợp từ AI</span>
+                {!aiResult && !loadingAi && (
+                  <button onClick={fetchAi} className="text-xs font-mono text-[var(--accent)] hover:underline">→ Tạo gợi ý từ data 4 tuần</button>
+                )}
+                {aiResult && (
+                  <button onClick={applyAllAi} className="text-xs font-mono text-[var(--accent)] hover:underline">→ Dùng tất cả</button>
+                )}
+              </div>
+              {loadingAi && <p className="text-sm italic text-[var(--muted)]">Đang phân tích data 4 tuần để gợi ý báo cáo tháng...</p>}
+              {aiResult && <p className="text-xs text-[var(--muted)] italic">AI đã tạo gợi ý. Bấm "→ Dùng gợi ý AI" ở từng phần hoặc "Dùng tất cả" ở trên.</p>}
             </div>
-            {loadingAi && <p className="text-sm italic text-[var(--muted)]">Đang phân tích data 4 tuần để gợi ý báo cáo tháng...</p>}
-            {aiResult && <p className="text-xs text-[var(--muted)] italic">AI đã tạo gợi ý. Bấm "→ Dùng gợi ý AI" ở từng phần hoặc "Dùng tất cả" ở trên.</p>}
-          </div>
 
-          <div>
-            <label className="block text-xs font-mono uppercase tracking-wider text-[var(--muted)] mb-2">Điểm con đạt được</label>
-            <select className="field w-full"
-              value={fields.diem_dat_duoc} onChange={e => updateField('diem_dat_duoc', e.target.value)}>
-              <option value="">-- Chọn điểm --</option>
-              {renderedOptions.map(opt => (
-                <option key={opt} value={opt}>{opt}</option>
-              ))}
-            </select>
-          </div>
+            <div>
+              <label className="block text-xs font-mono uppercase tracking-wider text-[var(--muted)] mb-2">Điểm con đạt được</label>
+              <select className="field w-full"
+                value={fields.diem_dat_duoc} onChange={e => updateField('diem_dat_duoc', e.target.value)}>
+                <option value="">-- Chọn điểm --</option>
+                {renderedOptions.map(opt => (
+                  <option key={opt} value={opt}>{opt}</option>
+                ))}
+              </select>
+            </div>
 
-          {[
-            { key1:'kt_dat', key2:'kt_caithien', label:'Kiến thức', dual:true },
-            { key1:'kn_dat', key2:'kn_caithien', label:'Kỹ năng làm bài', dual:true },
-            { key1:'td_dat', key2:'td_caithien', label:'Thái độ học tập', dual:false },
-            { key1:'khac_phuc', label:'Những nhược điểm con khắc phục được', dual:false },
-            { key1:'giai_phap', label:'Giải pháp định hướng', dual:false },
-          ].map(section => (
-            <div key={section.key1} className="paper-card rounded-md p-4">
-              <div className="flex items-baseline justify-between mb-3 flex-wrap gap-2">
-                <h3 className="font-display font-semibold text-lg">{section.label}</h3>
-                <div className="flex gap-2 flex-wrap">
-                  <button onClick={() => updateField(section.key1, fields[section.key1] ? fields[section.key1] + '\n' + TEMPLATES[section.key1] : TEMPLATES[section.key1])}
-                    className="chip hover:bg-[var(--ink)] hover:text-[var(--paper)] hover:border-[var(--ink)] text-xs">+ Mẫu nhanh</button>
-                  {aiResult && aiResult[section.key1] && (
-                    <button onClick={() => applyAi(section.key1)} className="chip chip-good hover:opacity-80 text-xs">→ Dùng gợi ý AI</button>
+            {[
+              { key1:'kt_dat', key2:'kt_caithien', label:'Kiến thức', dual:true },
+              { key1:'kn_dat', key2:'kn_caithien', label:'Kỹ năng làm bài', dual:true },
+              { key1:'td_dat', key2:'td_caithien', label:'Thái độ học tập', dual:false },
+              { key1:'khac_phuc', label:'Những nhược điểm con khắc phục được', dual:false },
+              { key1:'giai_phap', label:'Giải pháp định hướng', dual:false },
+            ].map(section => (
+              <div key={section.key1} className="paper-card rounded-md p-4">
+                <div className="flex items-baseline justify-between mb-3 flex-wrap gap-2">
+                  <h3 className="font-display font-semibold text-lg">{section.label}</h3>
+                  <div className="flex gap-2 flex-wrap">
+                    <button onClick={() => updateField(section.key1, fields[section.key1] ? fields[section.key1] + '\n' + TEMPLATES[section.key1] : TEMPLATES[section.key1])}
+                      className="chip hover:bg-[var(--ink)] hover:text-[var(--paper)] hover:border-[var(--ink)] text-xs">+ Mẫu nhanh</button>
+                    {aiResult && aiResult[section.key1] && (
+                      <button onClick={() => applyAi(section.key1)} className="chip chip-good hover:opacity-80 text-xs">→ Dùng gợi ý AI</button>
+                    )}
+                  </div>
+                </div>
+                <div className={section.dual ? 'grid grid-cols-1 md:grid-cols-2 gap-3' : ''}>
+                  <div>
+                    {section.dual && <label className="text-xs font-mono uppercase tracking-wider text-[var(--muted)] mb-1 block">Con đạt được</label>}
+                    <textarea className="field w-full" rows={6}
+                      placeholder={section.dual ? 'Con đạt được...' : 'Nhận xét...'}
+                      value={fields[section.key1]} onChange={e => updateField(section.key1, e.target.value)} />
+                  </div>
+                  {section.dual && (
+                    <div>
+                      <label className="text-xs font-mono uppercase tracking-wider text-[var(--muted)] mb-1 block">Con cần cải thiện</label>
+                      <textarea className="field w-full" rows={6} placeholder="Con cần cải thiện..."
+                        value={fields[section.key2]} onChange={e => updateField(section.key2, e.target.value)} />
+                    </div>
                   )}
                 </div>
               </div>
-              <div className={section.dual ? 'grid grid-cols-1 md:grid-cols-2 gap-3' : ''}>
-                <div>
-                  {section.dual && <label className="text-xs font-mono uppercase tracking-wider text-[var(--muted)] mb-1 block">Con đạt được</label>}
-                  <textarea className="field w-full" rows={6}
-                    placeholder={section.dual ? 'Con đạt được...' : 'Nhận xét...'}
-                    value={fields[section.key1]} onChange={e => updateField(section.key1, e.target.value)} />
-                </div>
-                {section.dual && (
-                  <div>
-                    <label className="text-xs font-mono uppercase tracking-wider text-[var(--muted)] mb-1 block">Con cần cải thiện</label>
-                    <textarea className="field w-full" rows={6} placeholder="Con cần cải thiện..."
-                      value={fields[section.key2]} onChange={e => updateField(section.key2, e.target.value)} />
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
-
-          <div className="flex gap-2 pt-2">
-            <button onClick={handleExportWord} disabled={exporting || saving}
-              className="ghost-btn px-5 py-2.5 rounded-md text-sm font-medium disabled:opacity-40">
-              {exporting ? 'Đang xuất Word...' : '📄 Xuất file Word'}
-            </button>
-            <button onClick={handleSave} disabled={saving || exporting}
-              className="accent-btn px-5 py-2.5 rounded-md text-sm font-medium flex-1 disabled:opacity-40">
-              {saving ? 'Đang lưu...' : '💾 Lưu vào Google Sheet'}
-            </button>
+            ))}
           </div>
+        </div>
+
+        <div className="sticky bottom-0 bg-[var(--paper)] border-t border-[var(--line)] px-6 py-4 flex gap-2 items-center">
+          <button onClick={handleExportWord} disabled={exporting}
+            className="ghost-btn px-4 py-2.5 rounded-md text-sm font-medium disabled:opacity-40">
+            {exporting ? 'Đang xuất Word...' : '📄 Xuất file Word'}
+          </button>
+          <button onClick={() => handleSave(false)} className="ghost-btn px-4 py-2.5 rounded-md text-sm font-medium hover:bg-[var(--accent)] hover:text-white transition-colors" style={{borderColor:'var(--accent)',color:'var(--accent-dark)'}} title="Lưu học sinh này và đóng cửa sổ">
+            💾 Lưu
+          </button>
+          <button onClick={() => handleSave(true)} className="ink-btn px-5 py-2.5 rounded-md text-sm font-semibold flex-1 flex items-center justify-center gap-1.5 shadow-md hover:shadow-lg transition-all" title="Lưu học sinh này và mở ngay học sinh tiếp theo trong lớp">
+            <span>{nextStudent ? '💾 Lưu & Tiếp theo ➔' : '💾 Lưu & Hoàn thành ✓'}</span>
+          </button>
         </div>
       </div>
     </div>
