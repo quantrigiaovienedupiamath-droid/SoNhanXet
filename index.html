@@ -562,8 +562,8 @@ function App() {
   const [currentYear]  = useState(now.getFullYear());
 
   // Tháng mục tiêu báo cáo (Tháng T = currentMonth - 1 khi đang ở tháng T+1)
-  const reportTargetMonth = currentMonth === 1 ? 12 : currentMonth - 1;
-  const reportTargetYear  = currentMonth === 1 ? currentYear - 1 : currentYear;
+const reportTargetMonth = currentMonth;
+const reportTargetYear  = currentYear;
   const [selectedMonthFilter, setSelectedMonthFilter] = useState('ALL');
 
   // Tick mỗi 30 giây để cập nhật countdown
