@@ -858,21 +858,26 @@ const reportTargetYear  = currentYear;
         {/* ── TAB BÁO CÁO THÁNG ─────────────────────────────── */}
         {mainTab === 'month' && (
         <>
-          <div className="mb-6 flex justify-between items-end flex-wrap gap-4">
+          <div className="mb-6 flex justify-between items-start flex-wrap gap-4">
             <div>
               <p className="text-xs font-mono uppercase tracking-[0.2em] text-[var(--muted)] mb-2">
                 Tháng {reportTargetMonth}/{reportTargetYear} & tháng trước
               </p>
               <h1 className="font-display text-4xl md:text-5xl font-semibold leading-none">Báo cáo tháng</h1>
+              <p className="mt-3 text-[var(--muted)]">
+                Viết báo cáo tổng kết tháng cho từng HS. Danh sách bao gồm tháng {reportTargetMonth}/{reportTargetYear} và tháng trước.
+              </p>
             </div>
-            <button onClick={reloadMonthly} disabled={loadingMonthly} className="chip chip-muted hover:bg-[var(--ink)] hover:text-[var(--paper)] transition-all font-mono text-xs flex items-center gap-1">
-              🔄 Tải lại dữ liệu
-            </button>
+            <div className="flex flex-col items-end gap-2">
+              <div className="paper-card rounded-lg px-4 py-3 border-l-4 border-red-500 text-right">
+                <p className="text-xs font-mono uppercase tracking-widest text-red-500 mb-1">⏰ Deadline Báo cáo Tháng {reportTargetMonth}/{reportTargetYear}</p>
+                <p className="font-display text-xl font-bold text-red-600">23:59 ngày 7/{reportTargetMonth < 12 ? reportTargetMonth + 1 : 1}/{reportTargetMonth < 12 ? reportTargetYear : reportTargetYear + 1}</p>
+              </div>
+              <button onClick={reloadMonthly} disabled={loadingMonthly} className="chip chip-muted hover:bg-[var(--ink)] hover:text-[var(--paper)] transition-all font-mono text-xs flex items-center gap-1">
+                🔄 Tải lại dữ liệu
+              </button>
+            </div>
           </div>
-          <p className="mt-3 text-[var(--muted)] max-w-2xl">
-            Viết báo cáo tổng kết tháng cho từng HS. Danh sách bao gồm tháng {reportTargetMonth}/{reportTargetYear} và tháng trước.
-            <strong> Deadline tháng này: 23:59 ngày 7/{reportTargetMonth < 12 ? reportTargetMonth + 1 : 1}/{reportTargetMonth < 12 ? reportTargetYear : reportTargetYear + 1}</strong>.
-          </p>
 
           {loadingMonthly ? (
             <div className="paper-card rounded-lg p-12 text-center text-[var(--muted)] font-mono text-sm">Đang tải danh sách HS...</div>
