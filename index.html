@@ -871,7 +871,7 @@ const reportTargetYear  = currentYear;
           </div>
           <p className="mt-3 text-[var(--muted)] max-w-2xl">
             Viết báo cáo tổng kết tháng cho từng HS. Danh sách bao gồm tháng {reportTargetMonth}/{reportTargetYear} và tháng trước.
-            <strong> Deadline tháng này: 23:59 ngày 7/{currentMonth}/{currentYear}</strong>.
+            <strong> Deadline tháng này: 23:59 ngày 7/{reportTargetMonth < 12 ? reportTargetMonth + 1 : 1}/{reportTargetMonth < 12 ? reportTargetYear : reportTargetYear + 1}</strong>.
           </p>
 
           {loadingMonthly ? (
