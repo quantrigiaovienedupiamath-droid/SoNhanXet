@@ -1,0 +1,16 @@
+{
+  "name": "sonhanxet-build",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:app": "node build.mjs"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.25.0",
+    "@babel/preset-env": "^7.25.0",
+    "@babel/preset-react": "^7.24.0",
+    "cssnano": "^7.0.0",
+    "postcss": "^8.4.0",
+    "tailwindcss": "^3.4.0"
+  }
+}
