@@ -18,6 +18,7 @@
     --accent: #4fb1b8; --accent-2: #7dc8cd; --accent-dark: #3a8d93;
     --good: #3a8d93; --warn: #b54708; --bad: #9a1f1f;
     --line: #d9d2bf; --muted: #6b6457;
+    --renew: #17497a;
   }
   * { box-sizing: border-box; }
   body {
@@ -46,6 +47,20 @@
   @keyframes fadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
   .fade-up { animation: fadeUp .35s ease-out both; }
   .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--paper); padding: 12px 20px; border-radius: 8px; font-size: 14px; z-index: 100; box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
+  /* ── Tag HS gia hạn ── */
+  .card-renew { border: 2px solid var(--renew) !important; padding-top: 36px !important; }
+  .renew-corner { position: absolute; top: -2px; left: -2px; background: var(--renew); color: #fff; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; line-height: 1.2; padding: 5px 12px; border-radius: 8px 0 8px 0; }
+  /* ── Thanh "Xem nhanh" ── */
+  .qf-label { font-size: 13px; font-weight: 500; color: var(--muted); margin-right: 2px; }
+  .qf-btn { display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 999px; font-size: 13px; font-weight: 600; background: #fff; border: 1.5px solid var(--line); color: var(--muted); cursor: pointer; transition: all .15s; font-family: inherit; }
+  .qf-btn:hover { transform: translateY(-1px); }
+  .qf-n { font-family: 'Geist Mono', monospace; font-size: 12px; font-weight: 500; padding: 1px 7px; border-radius: 999px; background: rgba(0,0,0,0.06); }
+  .qf-btn.on .qf-n { background: rgba(255,255,255,0.22); }
+  .qf-all.on { background: var(--ink); border-color: var(--ink); color: #fff; }
+  .qf-renew { border-color: var(--renew); color: var(--renew); }
+  .qf-renew.on { background: var(--renew); color: #fff; }
+  .qf-done { border-color: var(--accent); color: var(--accent-dark); }
+  .qf-done.on { background: var(--accent); color: #fff; }
   .month-divider { border-top: 2px solid var(--accent); margin: 32px 0 16px; padding-top: 12px; }
 </style>
 </head>
@@ -548,6 +563,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState(null);
   const [toast, setToast] = useState(null);
+  const [quickFilter, setQuickFilter] = useState('all'); // 'all' | 'renew' | 'done'
   const [mainTab, setMainTab] = useState('week');
   const [monthlyStudents, setMonthlyStudents] = useState([]);
   const [monthlyFile, setMonthlyFile] = useState(null);
@@ -654,6 +670,19 @@ const reportTargetYear  = currentYear;
     });
     return Object.entries(map).map(([code, list]) => ({ class_code: code, students: list }));
   }, [students]);
+
+  const hasFeedback = s => !!(s.feedback_text && String(s.feedback_text).trim());
+  const quickCounts = useMemo(() => ({
+    all: students.length,
+    renew: students.filter(s => s.is_renewal).length,
+    done: students.filter(hasFeedback).length,
+  }), [students]);
+  const visibleClasses = useMemo(() => {
+    if (quickFilter === 'all') return classesByCode;
+    return classesByCode
+      .map(c => ({ ...c, students: c.students.filter(s => quickFilter === 'renew' ? s.is_renewal : hasFeedback(s)) }))
+      .filter(c => c.students.length > 0);
+  }, [classesByCode, quickFilter]);
 
   const activeStudents = students.filter(s => !s.is_absent);
   const totalDone = activeStudents.filter(s => s.feedback_text && String(s.feedback_text).trim()).length;
@@ -779,6 +808,23 @@ const reportTargetYear  = currentYear;
             </button>
           </div>
 
+          {!loading && students.length > 0 && (
+            <div className="mb-6 flex items-center gap-2 flex-wrap">
+              <span className="qf-label">Xem nhanh</span>
+              {[
+                { k: 'all', label: 'Tất cả', cls: 'qf-all' },
+                { k: 'renew', label: 'Gia hạn', cls: 'qf-renew' },
+                { k: 'done', label: 'Đã NX', cls: 'qf-done' },
+              ].map(f => (
+                <button key={f.k} type="button"
+                  onClick={() => setQuickFilter(quickFilter === f.k && f.k !== 'all' ? 'all' : f.k)}
+                  className={`qf-btn ${f.cls} ${quickFilter === f.k ? 'on' : ''}`}>
+                  {f.label} <span className="qf-n">{quickCounts[f.k]}</span>
+                </button>
+              ))}
+            </div>
+          )}
+
           {loading ? (
             <div className="paper-card rounded-lg p-12 text-center text-[var(--muted)] font-mono text-sm">Đang tải...</div>
           ) : classesByCode.length === 0 ? (
@@ -786,11 +832,17 @@ const reportTargetYear  = currentYear;
               <p className="font-display text-lg mb-2">Chưa có dữ liệu cho tuần này</p>
               <p className="text-sm text-[var(--muted)]">LMS chưa xuất data, hoặc bạn không phụ trách lớp nào trong tuần.</p>
             </div>
+          ) : visibleClasses.length === 0 ? (
+            <div className="paper-card rounded-lg p-10 text-center">
+              <p className="text-sm text-[var(--muted)]">Không có học sinh nào khớp bộ lọc.</p>
+              <button type="button" onClick={() => setQuickFilter('all')} className="mt-3 text-xs font-mono underline text-[var(--ink)]">Xem tất cả</button>
+            </div>
           ) : (
             <div className="space-y-10">
-              {classesByCode.map((cls, i) => {
+              {visibleClasses.map((cls, i) => {
                 const sched = classes.find(c => c.class_code === cls.class_code);
-                const actv = cls.students.filter(s => !s.is_absent);
+                const fullCls = classesByCode.find(c => c.class_code === cls.class_code) || cls;
+                const actv = fullCls.students.filter(s => !s.is_absent);
                 const done = actv.filter(s => s.feedback_text && String(s.feedback_text).trim()).length;
                 const totalClass = actv.length;
                 const allDone = totalClass > 0 && done === totalClass;
@@ -815,7 +867,8 @@ const reportTargetYear  = currentYear;
                         return (
                           <button key={s.rowIndex} onClick={() => setSelected(s)}
                             style={cardStyle}
-                            className="paper-card rounded-lg p-4 text-left hover:shadow-lg transition-all hover:-translate-y-0.5 relative">
+                            className={`paper-card rounded-lg p-4 text-left hover:shadow-lg transition-all hover:-translate-y-0.5 relative flex flex-col justify-start items-stretch${s.is_renewal ? ' card-renew' : ''}`}>
+                            {s.is_renewal && <div className="renew-corner">Gia hạn</div>}
                             {s.is_gifted && <div className="absolute top-2 right-2"><span style={{background:'#EF9F27',color:'white',padding:'2px 8px',borderRadius:'999px',fontSize:'10px',fontWeight:'600'}}>🎁 Tặng buổi</span></div>}
                             {s.is_absent && !s.is_gifted && <div className="absolute top-2 right-2"><span style={{background:'#888780',color:'white',padding:'2px 8px',borderRadius:'999px',fontSize:'10px',fontWeight:'600'}}>Nghỉ cả tuần</span></div>}
                             {hasNote && !s.is_gifted && !s.is_absent && <div className="absolute top-2 right-2"><span className="stamp">đã NX</span></div>}
