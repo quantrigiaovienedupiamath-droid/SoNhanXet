@@ -619,6 +619,21 @@ const reportTargetYear  = currentYear;
     return () => clearInterval(id);
   }, []);
 
+  // Không còn lựa chọn "Tất cả các tháng": luôn chọn 1 tháng cụ thể.
+  // Mặc định = tháng đang chạy hạn (ngày 1–7: tháng trước; từ ngày 8: tháng này);
+  // nếu tháng đó không có HS thì chọn tháng nhỏ nhất đang có.
+  useEffect(() => {
+    const labels = Array.from(new Set(monthlyStudents.map(s => s.monthLabel).filter(Boolean)))
+      .sort((a, b) => monthLabelKey(a) - monthLabelKey(b));
+    if (labels.length === 0) return;
+    if (labels.includes(selectedMonthFilter)) return;
+    const d = new Date();
+    const dm = d.getDate() <= MONTHLY_DEADLINE_DAY ? (d.getMonth() === 0 ? 12 : d.getMonth()) : d.getMonth() + 1;
+    const dy = d.getDate() <= MONTHLY_DEADLINE_DAY && d.getMonth() === 0 ? d.getFullYear() - 1 : d.getFullYear();
+    const preferred = 'Tháng ' + dm + '/' + dy;
+    setSelectedMonthFilter(labels.includes(preferred) ? preferred : labels[0]);
+  }, [monthlyStudents]);
+
   const handleLogout = () => {
     sessionStorage.removeItem('teacher_login');
     sessionStorage.removeItem('teacher_name');
@@ -986,12 +1001,7 @@ const reportTargetYear  = currentYear;
                     {availableMonthLabels.length > 0 && (
                       <div className="mt-6 mb-6 flex items-center gap-3 flex-wrap">
                         <span className="text-xs font-mono uppercase tracking-wider text-[var(--muted)]">Xem tháng:</span>
-                        <div className="flex gap-1 p-1 bg-[var(--paper-2)] rounded-md inline-flex flex-wrap">
-                          <button
-                            onClick={() => setSelectedMonthFilter('ALL')}
-                            className={`px-3 py-1.5 text-xs rounded font-medium transition-all ${selectedMonthFilter === 'ALL' ? 'bg-[var(--ink)] text-[var(--paper)]' : 'text-[var(--ink)] hover:bg-black/5'}`}>
-                            Tất cả các tháng ({availableMonthLabels.length})
-                          </button>
+                        <div className="flex gap-2 p-1.5 bg-[var(--paper-2)] rounded-md inline-flex flex-wrap">
                           {availableMonthLabels.map(mLabel => {
                             const mCount = monthlyStudents.filter(s => s.monthLabel === mLabel).length;
                             const mDone = monthlyStudents.filter(s => s.monthLabel === mLabel && s.is_done).length;
@@ -999,7 +1009,7 @@ const reportTargetYear  = currentYear;
                               <button
                                 key={mLabel}
                                 onClick={() => setSelectedMonthFilter(mLabel)}
-                                className={`px-3 py-1.5 text-xs rounded font-medium transition-all ${selectedMonthFilter === mLabel ? 'bg-[var(--ink)] text-[var(--paper)]' : 'text-[var(--ink)] hover:bg-black/5'}`}>
+                                className={`px-4 py-1.5 text-xs rounded font-medium transition-all ${selectedMonthFilter === mLabel ? 'bg-[var(--ink)] text-[var(--paper)]' : 'text-[var(--ink)] hover:bg-black/5'}`}>
                                 {mLabel} ({mDone}/{mCount})
                               </button>
                             );
