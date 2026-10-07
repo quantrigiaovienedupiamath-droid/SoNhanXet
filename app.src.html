@@ -115,8 +115,18 @@ function cacheClear(pattern) {
   } catch(e) {}
 }
 
+// ── Đo thời gian gọi server (mở app với ?debug=1 để xem bảng đo) ──
+window.__snxPerf = window.__snxPerf || [];
+function recordPerf(method, ms, server, note) {
+  const e = { t: new Date().toLocaleTimeString('vi-VN'), method, ms: Math.round(ms), server, note };
+  window.__snxPerf.unshift(e);
+  window.__snxPerf.length = Math.min(window.__snxPerf.length, 40);
+  try { console.info('[SNX perf]', method, e.ms + 'ms', server ? ('server ' + server.ms + 'ms · ' + server.steps.join(' | ')) : '', note || ''); } catch (x) {}
+}
+
 function callApi(method, ...args) {
   const cacheKey = 'api_' + method + '_' + JSON.stringify(args);
+  const perfT0 = performance.now();
   if (CACHEABLE_METHODS.includes(method)) {
     const cached = cacheGet(cacheKey);
     if (cached) return Promise.resolve(cached);
@@ -143,6 +153,8 @@ function callApi(method, ...args) {
     let data;
     try { data = JSON.parse(text); }
     catch(e) { throw new Error('Lỗi định dạng dữ liệu: ' + text.substring(0, 100)); }
+    const serverPerf = data._perf; delete data._perf;
+    recordPerf(method, performance.now() - perfT0, serverPerf, data.error ? 'lỗi' : '');
     if (data.error) throw new Error(data.error);
     const finalResult = data.result !== undefined ? data.result : data;
     if (CACHEABLE_METHODS.includes(method)) {
@@ -371,6 +383,18 @@ function snapGet(kind, login) {
 }
 function snapSet(kind, login, data) {
   try { localStorage.setItem(snapKey(kind, login), JSON.stringify({ ts: Date.now(), data })); } catch (e) {}
+}
+
+// Báo cáo tháng: trước ngày 20 chỉ hiện tháng trước; từ ngày 20 hiện thêm tháng này
+const MONTHLY_SHOW_CURRENT_FROM_DAY = 20;
+function visibleReportMonths(d = new Date()) {
+  const m = d.getMonth() + 1, y = d.getFullYear();
+  const prev = m === 1 ? { m: 12, y: y - 1 } : { m: m - 1, y };
+  return d.getDate() >= MONTHLY_SHOW_CURRENT_FROM_DAY ? [prev, { m, y }] : [prev];
+}
+function filterReportMonths(list) {
+  const allowed = visibleReportMonths().map(x => x.y * 100 + x.m);
+  return (list || []).filter(s => allowed.includes(Number(s.year) * 100 + Number(s.month)));
 }
 
 // Dữ liệu tải từ server có thể chưa có các nhận xét GV vừa lưu (còn trong hàng chờ)
@@ -694,7 +718,7 @@ const reportTargetYear  = currentYear;
     try {
       const d = await callApi('getMonthlyStudents', teacher.login, reportTargetMonth, reportTargetYear);
       if (d && !d.error) {
-        setMonthlyStudents(applyPendingMonthly(d.students || []));
+        setMonthlyStudents(applyPendingMonthly(filterReportMonths(d.students)));
         setMonthlyFile(d.file);
         monthlyFetchedAt.current = Date.now();
       } else if (d && d.error && showSpinner) {
@@ -711,7 +735,7 @@ const reportTargetYear  = currentYear;
     if (!teacher) return;
     const snap = snapGet('month', teacher.login);
     if (snap) {
-      setMonthlyStudents(applyPendingMonthly(snap.students || []));
+      setMonthlyStudents(applyPendingMonthly(filterReportMonths(snap.students)));
       setMonthlyFile(snap.file || null);
     }
     fetchMonthly(!snap && mainTab === 'month');
@@ -1056,11 +1080,11 @@ const reportTargetYear  = currentYear;
           <div className="mb-6 flex justify-between items-start flex-wrap gap-4">
             <div>
               <p className="text-xs font-mono uppercase tracking-[0.2em] text-[var(--muted)] mb-2">
-                Tháng {reportTargetMonth}/{reportTargetYear} & tháng trước
+                {visibleReportMonths().map(x => 'Tháng ' + x.m + '/' + x.y).join(' & ')}
               </p>
               <h1 className="font-display text-4xl md:text-5xl font-semibold leading-none">Báo cáo tháng</h1>
               <p className="mt-3 text-[var(--muted)]">
-                Viết báo cáo tổng kết tháng cho từng HS. Danh sách bao gồm tháng {reportTargetMonth}/{reportTargetYear} và tháng trước.
+                Viết báo cáo tổng kết tháng cho từng HS. Danh sách gồm {visibleReportMonths().map(x => 'tháng ' + x.m + '/' + x.y).join(' và ')}.{now.getDate() < MONTHLY_SHOW_CURRENT_FROM_DAY ? ` Báo cáo tháng ${currentMonth}/${currentYear} sẽ mở từ ngày ${MONTHLY_SHOW_CURRENT_FROM_DAY}/${currentMonth}.` : ''}
               </p>
             </div>
             <div className="flex flex-col items-end gap-2">
@@ -1267,6 +1291,23 @@ const reportTargetYear  = currentYear;
 }
 
 // ── Detail panel nhận xét tuần ─────────────────────────────
+// Bấm ra vùng nền mờ bên ngoài (hoặc phím Esc) để đóng khung nhận xét.
+// Chỉ đóng khi cả lúc nhấn lẫn lúc thả chuột đều ở nền mờ — tránh đóng nhầm khi
+// GV bôi đen chữ trong ô nhận xét rồi kéo chuột ra ngoài. Nội dung đang gõ đã
+// được tự lưu nháp nên đóng không bị mất.
+function useBackdropClose(onClose) {
+  const downOnBackdrop = useRef(false);
+  useEffect(() => {
+    const onKey = e => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  return {
+    onMouseDown: e => { downOnBackdrop.current = e.target === e.currentTarget; },
+    onClick: e => { if (downOnBackdrop.current && e.target === e.currentTarget) onClose(); downOnBackdrop.current = false; },
+  };
+}
+
 function DetailPanel({ student, classStudents, fileId, tab, currentMonth, currentYear, teacherLogin, onClose, onSaved, onSelectStudent }) {
   const [view, setView] = useState('write');
   const [note, setNote] = useState(student.feedback_text != null ? String(student.feedback_text) : '');
@@ -1280,6 +1321,7 @@ function DetailPanel({ student, classStudents, fileId, tab, currentMonth, curren
   const [draftNotice, setDraftNotice] = useState(false);
 
   const draftKey = `fb_${tab}_${student.student_id}`;
+  const backdropHandlers = useBackdropClose(onClose);
 
   // Khôi phục bản nháp nếu có
   useEffect(() => {
@@ -1437,8 +1479,8 @@ ${note}`;
   ];
 
   return (
-    <div className="fixed inset-0 bg-[var(--ink)]/40 backdrop-blur-sm z-50 flex justify-end fade-up">
-      <div className="bg-[var(--paper)] w-full max-w-2xl h-full overflow-y-auto shadow-2xl flex flex-col justify-between">
+    <div className="fixed inset-0 bg-[var(--ink)]/40 backdrop-blur-sm z-50 flex justify-end fade-up" style={{cursor:'pointer'}} {...backdropHandlers}>
+      <div className="bg-[var(--paper)] w-full max-w-2xl h-full overflow-y-auto shadow-2xl flex flex-col justify-between" style={{cursor:'auto'}}>
         <div>
           {/* Header Drawer */}
           <div className="sticky top-0 bg-[var(--paper)] border-b border-[var(--line)] px-6 py-4 z-10">
@@ -1651,6 +1693,7 @@ function MonthlyDetailPanel({ student, classStudents, fileId, currentMonth, curr
   const [aiResult, setAiResult] = useState(null);
 
   const draftKey = `monthly_${fileId}_${student.student_id}`;
+  const backdropHandlers = useBackdropClose(onClose);
 
   // Khôi phục bản nháp nếu có
   useEffect(() => {
@@ -1789,8 +1832,8 @@ function MonthlyDetailPanel({ student, classStudents, fileId, currentMonth, curr
   };
 
   return (
-    <div className="fixed inset-0 bg-[var(--ink)]/40 backdrop-blur-sm z-50 flex justify-end fade-up">
-      <div className="bg-[var(--paper)] w-full max-w-3xl h-full overflow-y-auto shadow-2xl flex flex-col justify-between">
+    <div className="fixed inset-0 bg-[var(--ink)]/40 backdrop-blur-sm z-50 flex justify-end fade-up" style={{cursor:'pointer'}} {...backdropHandlers}>
+      <div className="bg-[var(--paper)] w-full max-w-3xl h-full overflow-y-auto shadow-2xl flex flex-col justify-between" style={{cursor:'auto'}}>
         <div>
           <div className="sticky top-0 bg-[var(--paper)] border-b border-[var(--line)] px-6 py-4 z-10">
             <div className="flex items-start justify-between gap-4">
@@ -1896,6 +1939,38 @@ function MonthlyDetailPanel({ student, classStudents, fileId, currentMonth, curr
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+
+// ── Bảng đo thời gian (chỉ hiện khi URL có ?debug=1) ──
+function PerfPanel() {
+  const [, setTick] = useState(0);
+  const [open, setOpen] = useState(true);
+  useEffect(() => { const id = setInterval(() => setTick(t => t + 1), 1000); return () => clearInterval(id); }, []);
+  const list = window.__snxPerf || [];
+  const nav = performance.getEntriesByType('navigation')[0];
+  return (
+    <div style={{position:'fixed',right:12,bottom:12,zIndex:9999,width:open?460:'auto',maxWidth:'calc(100vw - 24px)',maxHeight:'60vh',overflow:'auto',background:'#0f2733',color:'#e8f1f2',fontFamily:'Geist Mono, monospace',fontSize:11,borderRadius:8,boxShadow:'0 8px 32px rgba(0,0,0,.35)'}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 10px',borderBottom:'1px solid rgba(255,255,255,.12)',position:'sticky',top:0,background:'#0f2733'}}>
+        <b>⏱ Đo thời gian</b>
+        <span>
+          {nav && <span style={{opacity:.7,marginRight:8}}>tải trang {Math.round(nav.domContentLoadedEventEnd)}ms</span>}
+          <button onClick={() => setOpen(!open)} style={{color:'#7dc8cd'}}>{open ? 'thu gọn' : 'mở'}</button>
+        </span>
+      </div>
+      {open && (list.length === 0 ? <div style={{padding:10,opacity:.7}}>Chưa có lượt gọi server nào.</div> :
+        list.map((e, i) => (
+          <div key={i} style={{padding:'6px 10px',borderBottom:'1px solid rgba(255,255,255,.06)'}}>
+            <div><span style={{opacity:.6}}>{e.t}</span> <b>{e.method}</b> <span style={{color:e.ms>5000?'#ff8a8a':e.ms>2000?'#ffd27a':'#8be0a4'}}>{(e.ms/1000).toFixed(1)}s</span>{e.server && <span style={{opacity:.75}}> · server {(e.server.ms/1000).toFixed(1)}s</span>}{e.note && <span style={{color:'#ff8a8a'}}> · {e.note}</span>}</div>
+            {e.server && e.server.steps && e.server.steps.length > 0 && <div style={{opacity:.7,marginTop:2,lineHeight:1.5}}>{e.server.steps.join(' → ')}</div>}
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+if (/[?&]debug=1/.test(location.search)) {
+  const el = document.createElement('div'); document.body.appendChild(el);
+  ReactDOM.createRoot(el).render(<PerfPanel />);
+}
 </script>
 </body>
 </html>
