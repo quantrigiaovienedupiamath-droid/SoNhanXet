@@ -69,7 +69,7 @@
 
   <div class="summary" id="summary"></div>
   <div class="card scroll"><table>
-    <thead><tr><th>Bấm lưu lúc</th><th>GV</th><th>Loại</th><th>Tuần / Tháng</th><th>Học sinh</th><th>Lớp</th><th>Trạng thái</th></tr></thead>
+    <thead><tr><th>Thời gian</th><th>GV</th><th>Loại</th><th>Tuần / Tháng</th><th>Học sinh</th><th>Lớp</th><th>Trạng thái</th></tr></thead>
     <tbody id="rows"><tr><td colspan="7" class="muted">Chọn điều kiện rồi bấm Tìm.</td></tr></tbody>
   </table></div>
 </div>
@@ -81,13 +81,14 @@ try { PW = sessionStorage.getItem('snx_admin_pw') || ''; } catch (e) {}
 let ITEMS = [];
 
 const fmt = t => t ? new Date(t).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh', hour12: false }) : '';
+const hm = t => t ? new Date(t).toLocaleTimeString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh', hour12: false, hour: '2-digit', minute: '2-digit' }) : '';
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 function statusOf(it) {
-  if (it.writtenAt) return { cls: 'ok', text: '✓ Đã ghi Sheet' + (it.row ? ' (dòng ' + it.row + ')' : '') };
+  if (it.writtenAt) return { cls: 'ok', text: '✓ Đã ghi Sheet' + (it.row ? ' (dòng ' + it.row + ')' : '') + ' lúc ' + hm(it.writtenAt) };
   if (it.mismatchAt) return { cls: 'warn', text: '⚠ Đã ghi nhưng lệch nội dung' + (it.row ? ' (dòng ' + it.row + ')' : '') };
   if (it.result === 'failed') return { cls: 'bad', text: '✗ Server từ chối' };
   if (it.result === 'error') return { cls: 'bad', text: '✗ Lỗi mạng/quá thời gian' };
-  if (it.result === 'ok') return { cls: 'ok', text: '✓ Đã lưu (chưa có xác nhận server)' };
+  if (it.result === 'ok') return { cls: 'wait', text: '✓ App báo đã lưu · thiếu xác nhận server' };
   return { cls: 'wait', text: '… Chưa có kết quả' };
 }
 const KIND = { week: 'Nhận xét tuần', month: 'Báo cáo tháng' };
@@ -110,13 +111,26 @@ async function api(params) {
 }
 
 function render() {
-  const n = ITEMS.length, ok = ITEMS.filter(i => i.writtenAt).length, bad = ITEMS.filter(i => !i.writtenAt && (i.result === 'failed' || i.result === 'error')).length;
-  $('summary').innerHTML = `<span class="pill">${n} lần lưu</span><span class="pill" style="color:var(--good)">${ok} đã ghi Sheet</span><span class="pill" style="color:var(--bad)">${bad} lỗi</span><span class="pill" style="color:var(--warn)">${n - ok - bad} chưa có kết quả</span>`;
+  const n = ITEMS.length;
+  const c = { ok: 0, warn: 0, bad: 0, nc: 0, wait: 0 };
+  ITEMS.forEach(i => {
+    if (i.writtenAt) c.ok++; else if (i.mismatchAt) c.warn++;
+    else if (i.result === 'failed' || i.result === 'error') c.bad++;
+    else if (i.result === 'ok') c.nc++; else c.wait++;
+  });
+  $('summary').innerHTML = `<span class="pill">${n} lần lưu</span><span class="pill" style="color:var(--good)">${c.ok} đã ghi Sheet</span>`
+    + (c.warn ? `<span class="pill" style="color:var(--warn)">${c.warn} lệch nội dung</span>` : '')
+    + `<span class="pill" style="color:var(--bad)">${c.bad} lỗi</span>`
+    + `<span class="pill" style="color:var(--warn)" title="App báo lưu xong nhưng Apps Script chưa gửi xác nhận — thường là các lần lưu trước khi bật LOG_SECRET (trước 15:46 9/10/2026)">${c.nc} thiếu xác nhận server</span>`
+    + `<span class="pill" style="color:var(--muted)" title="Đã có lần bấm lưu nhưng máy GV chưa gửi kết quả lên (sẽ tự gửi khi GV mở lại app)">${c.wait} chưa có kết quả</span>`;
   if (!n) { $('rows').innerHTML = '<tr><td colspan="7" class="muted">Không có lần lưu nào khớp điều kiện.</td></tr>'; return; }
   $('rows').innerHTML = ITEMS.map((it, i) => {
     const st = statusOf(it);
     const first = it.attemptAt || (it.events[0] && it.events[0].at);
-    return `<tr class="row" data-i="${i}"><td class="mono">${esc(fmt(first))}</td><td>${esc(it.login)}</td><td>${esc(KIND[it.kind] || it.kind || '')}</td><td class="mono">${esc(it.period)}</td><td>${esc(it.student_name)} <span class="mono muted">${esc(it.student_id)}</span></td><td class="mono">${esc(it.class_code)}</td><td><span class="st ${st.cls}">${esc(st.text)}</span>${(it.mismatch || it.error) && !it.writtenAt ? '<div class="muted" style="font-size:12px;margin-top:4px">' + esc(it.mismatch || it.error) + '</div>' : ''}</td></tr>`;
+    const last = it.events.length ? it.events[it.events.length - 1].at : first;
+    const retried = first && last && (new Date(last) - new Date(first) > 60000);
+    const timeCell = esc(fmt(last)) + (retried ? '<div class="muted" style="font-size:11px;margin-top:3px">bấm lần đầu: ' + esc(fmt(first)) + '</div>' : '');
+    return `<tr class="row" data-i="${i}"><td class="mono">${timeCell}</td><td>${esc(it.login)}</td><td>${esc(KIND[it.kind] || it.kind || '')}</td><td class="mono">${esc(it.period)}</td><td>${esc(it.student_name)} <span class="mono muted">${esc(it.student_id)}</span></td><td class="mono">${esc(it.class_code)}</td><td><span class="st ${st.cls}">${esc(st.text)}</span>${(it.mismatch || it.error) && !it.writtenAt ? '<div class="muted" style="font-size:12px;margin-top:4px">' + esc(it.mismatch || it.error) + '</div>' : ''}</td></tr>`;
   }).join('');
 }
 
