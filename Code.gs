@@ -178,7 +178,31 @@ function serverAuditLog_(evt) {
   } catch (e) { Logger.log('serverAuditLog_ lỗi: ' + e); }
 }
 
-function sameVal_(a, b) { return String(a == null ? '' : a).trim() === String(b == null ? '' : b).trim(); }
+// So sánh giá trị đã ghi với giá trị đọc lại — bỏ qua khác biệt định dạng vô hại
+function normCell_(v) {
+  if (v instanceof Date) return Utilities.formatDate(v, 'GMT+7', 'dd/MM/yyyy HH:mm');
+  return String(v == null ? '' : v).replace(/\r\n?/g, '\n').replace(/[ \t ]+/g, ' ').replace(/ *\n */g, '\n').trim();
+}
+function sameVal_(a, b) {
+  const x = normCell_(a), y = normCell_(b);
+  if (x === y) return true;
+  const num = /^-?\d+(?:[.,]\d+)?$/;            // 8,5 ↔ 8.5 ; 10 ↔ 10.0
+  if (num.test(x) && num.test(y)) return Number(x.replace(',', '.')) === Number(y.replace(',', '.'));
+  return false;
+}
+// Chữ bắt đầu bằng = + - @ sẽ bị Sheet hiểu là công thức (#ERROR!) → thêm ' để giữ nguyên chữ
+function safeCell_(v) { return (typeof v === 'string' && /^[=+\-@]/.test(v)) ? "'" + v : v; }
+// Liệt kê cột ghi ≠ đọc lại, để báo lỗi rõ ràng
+function diffCols_(back, start, written, letters) {
+  const out = [];
+  for (let k = 0; k < written.length; k++) {
+    if (!sameVal_(back[start + k], written[k])) {
+      const short = v => { const t = normCell_(v); return t.length > 25 ? t.slice(0, 25) + '…' : t; };
+      out.push('cột ' + letters[k] + ': ghi "' + short(written[k]) + '" nhưng Sheet có "' + short(back[start + k]) + '"');
+    }
+  }
+  return out;
+}
 
 // ============================================================
 // AUTH
@@ -1772,16 +1796,20 @@ function saveFeedback(monthlyFileId, tabName, rowIndex, feedbackText, parentTemp
   
   // ── GHI TRỰC TIẾP: Cột H-L (8-12) và cột O (15), không đọc trước (Tối ưu 100% I/O) ──
   const written = [statusEvaluation || '', scoreB1 || '', scoreB2 || '', feedbackText || '', parentTemplate || ''];
-  sheet.getRange(targetRow, 8, 1, 5).setValues([written]);
+  sheet.getRange(targetRow, 8, 1, 5).setValues([written.map(safeCell_)]);
   sheet.getRange(targetRow, 15, 1, 1).setValue(updatedAt);
   SpreadsheetApp.flush();
 
   // Đọc lại để chắc chắn đã ghi đúng (đúng dòng, đúng HS, đúng nội dung)
   const back = sheet.getRange(targetRow, 1, 1, 15).getValues()[0];
-  const ok = (!studentId || sameVal_(back[1], studentId)) &&
-             sameVal_(back[7], written[0]) && sameVal_(back[8], written[1]) && sameVal_(back[9], written[2]) &&
-             sameVal_(back[10], written[3]);
-  if (!ok) return { error: 'Đã ghi nhưng kiểm tra lại không khớp (dòng ' + targetRow + '). Vui lòng bấm Thử lại.' };
+  if (studentId && !sameVal_(back[1], studentId))
+    return { error: 'Dòng ' + targetRow + ' không còn là HS ' + studentId + ' (Sheet vừa bị chèn/xoá dòng). Vui lòng tải lại trang rồi lưu lại.' };
+  const diffs = diffCols_(back, 7, written.slice(0, 4), ['H', 'I', 'J', 'K']);
+  if (diffs.length) {
+    serverAuditLog_({ event: 'written', status: 'mismatch', error: diffs.join(' | '), reqId: reqId || '', login: login, kind: 'week',
+      fileId: monthlyFileId, period: tabName, row: targetRow, studentId: studentId || back[1], studentName: back[2], classCode: back[4], updatedAt: updatedAt });
+    return { error: 'Đã ghi vào dòng ' + targetRow + ' nhưng nội dung trong Sheet khác bản GV viết (' + diffs.join('; ') + '). Vui lòng chụp màn hình gửi Admin.' };
+  }
 
   serverAuditLog_({ event: 'written', reqId: reqId || '', login: login, kind: 'week', fileId: monthlyFileId,
     period: tabName, row: targetRow, studentId: studentId || back[1], studentName: back[2], classCode: back[4], updatedAt: updatedAt });
@@ -3358,14 +3386,19 @@ function saveMonthlyReport(monthlyFileId, rowIndex, payload, login, studentId, r
     payload.khac_phuc || '',
     payload.giai_phap || '',
   ];
-  tab.getRange(targetRow, 6, 1, 9).setValues([written]);
+  tab.getRange(targetRow, 6, 1, 9).setValues([written.map(safeCell_)]);
   tab.getRange(targetRow, 16, 1, 1).setValue(updatedAt);
   SpreadsheetApp.flush();
 
   const back = tab.getRange(targetRow, 1, 1, 14).getValues()[0];
-  let ok = !studentId || sameVal_(back[0], studentId);
-  for (let k = 0; k < written.length && ok; k++) ok = sameVal_(back[5 + k], written[k]);
-  if (!ok) return { error: 'Đã ghi nhưng kiểm tra lại không khớp (dòng ' + targetRow + '). Vui lòng bấm Thử lại.' };
+  if (studentId && !sameVal_(back[0], studentId))
+    return { error: 'Dòng ' + targetRow + ' không còn là HS ' + studentId + ' (Sheet vừa bị chèn/xoá dòng). Vui lòng tải lại trang rồi lưu lại.' };
+  const diffs = diffCols_(back, 5, written, ['F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N']);
+  if (diffs.length) {
+    serverAuditLog_({ event: 'written', status: 'mismatch', error: diffs.join(' | '), reqId: reqId || '', login: login, kind: 'month',
+      fileId: monthlyFileId, period: 'Monthly', row: targetRow, studentId: studentId || back[0], studentName: back[1], classCode: back[2], updatedAt: updatedAt });
+    return { error: 'Đã ghi vào dòng ' + targetRow + ' nhưng nội dung trong Sheet khác bản GV viết (' + diffs.join('; ') + '). Vui lòng chụp màn hình gửi Admin.' };
+  }
 
   serverAuditLog_({ event: 'written', reqId: reqId || '', login: login, kind: 'month', fileId: monthlyFileId,
     period: 'Monthly', row: targetRow, studentId: studentId || back[0], studentName: back[1], classCode: back[2], updatedAt: updatedAt });

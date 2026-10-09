@@ -30,6 +30,7 @@
   .st { display:inline-block; font-weight:600; font-size:12px; padding:2px 8px; border-radius:999px; white-space:nowrap; }
   .ok { color:var(--good); background:#e7f5ef; border:1px solid #b9e0cf; }
   .bad { color:var(--bad); background:#fdecec; border:1px solid #f2c1c1; }
+  .warn { color:var(--warn); background:#fff4e5; border:1px solid #f5d0a0; }
   .wait { color:var(--warn); background:#fff4e5; border:1px solid #f5d3a6; }
   .detail td { background:#f7f3ea; }
   .detail pre { white-space:pre-wrap; margin:0; font-family:inherit; font-size:13px; line-height:1.5; }
@@ -83,6 +84,7 @@ const fmt = t => t ? new Date(t).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Ch
 const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 function statusOf(it) {
   if (it.writtenAt) return { cls: 'ok', text: '✓ Đã ghi Sheet' + (it.row ? ' (dòng ' + it.row + ')' : '') };
+  if (it.mismatchAt) return { cls: 'warn', text: '⚠ Đã ghi nhưng lệch nội dung' + (it.row ? ' (dòng ' + it.row + ')' : '') };
   if (it.result === 'failed') return { cls: 'bad', text: '✗ Server từ chối' };
   if (it.result === 'error') return { cls: 'bad', text: '✗ Lỗi mạng/quá thời gian' };
   if (it.result === 'ok') return { cls: 'ok', text: '✓ Đã lưu (chưa có xác nhận server)' };
@@ -114,7 +116,7 @@ function render() {
   $('rows').innerHTML = ITEMS.map((it, i) => {
     const st = statusOf(it);
     const first = it.attemptAt || (it.events[0] && it.events[0].at);
-    return `<tr class="row" data-i="${i}"><td class="mono">${esc(fmt(first))}</td><td>${esc(it.login)}</td><td>${esc(KIND[it.kind] || it.kind || '')}</td><td class="mono">${esc(it.period)}</td><td>${esc(it.student_name)} <span class="mono muted">${esc(it.student_id)}</span></td><td class="mono">${esc(it.class_code)}</td><td><span class="st ${st.cls}">${esc(st.text)}</span>${it.error && !it.writtenAt ? '<div class="muted" style="font-size:12px;margin-top:4px">' + esc(it.error) + '</div>' : ''}</td></tr>`;
+    return `<tr class="row" data-i="${i}"><td class="mono">${esc(fmt(first))}</td><td>${esc(it.login)}</td><td>${esc(KIND[it.kind] || it.kind || '')}</td><td class="mono">${esc(it.period)}</td><td>${esc(it.student_name)} <span class="mono muted">${esc(it.student_id)}</span></td><td class="mono">${esc(it.class_code)}</td><td><span class="st ${st.cls}">${esc(st.text)}</span>${(it.mismatch || it.error) && !it.writtenAt ? '<div class="muted" style="font-size:12px;margin-top:4px">' + esc(it.mismatch || it.error) + '</div>' : ''}</td></tr>`;
   }).join('');
 }
 

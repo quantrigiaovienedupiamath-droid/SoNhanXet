@@ -46,7 +46,8 @@ export default async function handler(req, res) {
       g.events.push(r);
       for (const k of ['login', 'kind', 'period', 'student_id', 'student_name', 'class_code']) if (!g[k] && r[k]) g[k] = r[k];
       if (r.event === 'attempt') { g.attemptAt = g.attemptAt || r.at; g.content = g.content || r.content; }
-      if (r.event === 'written') { g.writtenAt = r.at; g.row = r.row_index; }
+      if (r.event === 'written' && r.status === 'mismatch') { g.mismatchAt = r.at; g.mismatch = r.error; g.row = r.row_index; }
+      else if (r.event === 'written') { g.writtenAt = r.at; g.row = r.row_index; }
       if (r.event === 'result') { g.result = r.status; g.error = r.error || g.error; g.resultAt = r.at; }
     }
     const items = ids.map(id => map.get(id)).filter(Boolean);
