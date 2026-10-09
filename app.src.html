@@ -62,6 +62,15 @@
   .qf-done { border-color: var(--accent); color: var(--accent-dark); }
   .qf-done.on { background: var(--accent); color: #fff; }
   .month-divider { border-top: 2px solid var(--accent); margin: 32px 0 16px; padding-top: 12px; }
+  .snx-pop-wrap{position:fixed;top:0;right:0;height:100%;width:100%;max-width:42rem;z-index:55;display:grid;place-items:center;padding:24px;background:rgba(253,251,244,.72);backdrop-filter:blur(2px);animation:snxFade .15s ease-out}
+  .snx-pop{width:100%;max-width:420px;border:2px solid;border-radius:14px;padding:28px 24px 22px;text-align:center;box-shadow:0 18px 50px rgba(19,56,73,.22)}
+  .snx-pop-icon{width:56px;height:56px;border-radius:50%;display:grid;place-items:center;font-size:30px;font-weight:700;margin:0 auto 14px}
+  .snx-spinner{width:52px;height:52px;border-radius:50%;border:5px solid rgba(59,111,216,.2);border-top-color:#3b6fd8;margin:0 auto 16px;animation:snxSpin .8s linear infinite}
+  .snx-pop-title{font-family:'Fraunces',serif;font-size:21px;font-weight:700;line-height:1.25;margin:0 0 8px}
+  .snx-pop-body{font-size:14.5px;line-height:1.55;margin:0}
+  .snx-pop-actions{display:flex;gap:8px;justify-content:center;margin-top:18px;flex-wrap:wrap}
+  @keyframes snxSpin{to{transform:rotate(360deg)}}
+  @keyframes snxFade{from{opacity:0}to{opacity:1}}
 </style>
 </head>
 <body>
@@ -264,7 +273,7 @@ class SyncQueueManager {
   statusFor(type, fileId, tab, studentId) {
     const key = SyncQueueManager.keyOf({ type, fileId, tab, studentId });
     const t = this.queue.find(x => SyncQueueManager.keyOf(x) === key);
-    if (t) return { state: t.state, lastError: t.lastError, id: t.id };
+    if (t) return { state: t.state, lastError: t.lastError, id: t.id, attempts: t.attempts || 0, nextTryAt: t.nextTryAt || 0 };
     return this.done[key] ? { state: 'saved', ...this.done[key] } : null;
   }
 
@@ -390,6 +399,62 @@ function SaveStatusBar({ st, onRetry }) {
     <div style={{...base,background:failed?'#fef2f2':'#fff7ed',border:'1px solid ' + (failed?'#fecaca':'#fed7aa'),color:failed?'#9a1f1f':'#b54708'}}>
       <span>⚠️ <strong>Chưa lưu được vào Sheet.</strong> {st.lastError ? 'Lý do: ' + st.lastError + '.' : ''} {failed ? 'Bấm Thử lại; nếu vẫn lỗi hãy báo Admin.' : 'Hệ thống đang tự thử lại.'} Nhận xét vẫn được giữ trên máy này.</span>
       <button type="button" onClick={onRetry} className="ghost-btn px-3 py-1.5 rounded-md text-xs font-medium" style={{whiteSpace:'nowrap'}}>Thử lại</button>
+    </div>
+  );
+}
+
+
+// Popup trạng thái lưu — hiện to, giữa khung nhận xét, để GV không bỏ sót
+function SavePopup({ st, kind, onRetry, onDismiss }) {
+  const [now, setNow] = useState(Date.now());
+  const [startAt] = useState(Date.now());
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 500); return () => clearInterval(t); }, []);
+  if (!st) return null;
+  const what = kind === 'monthly' ? 'báo cáo' : 'nhận xét';
+  const stop = e => e.stopPropagation();
+  let tone, icon, title, body, actions = null;
+  if (st.state === 'saved') {
+    tone = { bg: '#ecf8f3', bd: '#3a8d93', fg: '#1f6f5c' };
+    icon = <div className="snx-pop-icon" style={{ background: '#3a8d93', color: '#fff' }}>✓</div>;
+    title = 'Đã lưu vào Google Sheet';
+    body = <>Đã ghi thành công{st.at ? <> lúc <b>{st.at}</b></> : ''}{st.row ? <> (dòng {st.row})</> : ''}.</>;
+  } else if (st.state === 'pending' || st.state === 'sending') {
+    const sec = Math.max(0, Math.round((now - startAt) / 1000));
+    tone = { bg: '#eef4ff', bd: '#3b6fd8', fg: '#1d4ed8' };
+    icon = <div className="snx-spinner" />;
+    title = `Đang lưu ${what} vào Google Sheet…`;
+    body = <>Vui lòng chờ, <b>không đóng khung hoặc trình duyệt</b>.<br /><span style={{ opacity: .75 }}>Đã chờ {sec} giây · thường mất 2–6 giây</span></>;
+  } else if (st.state === 'error') {
+    const left = st.nextTryAt ? Math.max(0, Math.ceil((st.nextTryAt - now) / 1000)) : 0;
+    tone = { bg: '#fff6ea', bd: '#d97706', fg: '#9a4a06' };
+    icon = <div className="snx-pop-icon" style={{ background: '#d97706', color: '#fff' }}>!</div>;
+    title = `Chưa lưu được — đang tự thử lại`;
+    body = <>Mất kết nối hoặc máy chủ phản hồi chậm{st.lastError ? <> ({st.lastError})</> : ''}.<br />
+      {left > 0 ? <>Tự thử lại sau <b>{left} giây</b> (đã thử {st.attempts} lần).</> : <>Đang thử lại…</>}<br />
+      <span style={{ opacity: .8 }}>{what[0].toUpperCase() + what.slice(1)} vẫn được giữ trên máy này, chưa mất.</span></>;
+    actions = <>
+      <button type="button" onClick={onDismiss} className="ghost-btn px-4 py-2 rounded-md text-sm">Ẩn, sửa tiếp</button>
+      <button type="button" onClick={onRetry} className="ink-btn px-4 py-2 rounded-md text-sm font-semibold">Thử lại ngay</button>
+    </>;
+  } else {
+    tone = { bg: '#fdf0f0', bd: '#c0392b', fg: '#9a1f1f' };
+    icon = <div className="snx-pop-icon" style={{ background: '#c0392b', color: '#fff' }}>✕</div>;
+    title = 'KHÔNG lưu được vào Google Sheet';
+    body = <>Lý do: <b>{st.lastError || 'không rõ'}</b><br />
+      {what[0].toUpperCase() + what.slice(1)} vẫn được giữ trên máy này. Bấm <b>Thử lại</b>; nếu vẫn lỗi, hãy chụp màn hình này gửi Admin.</>;
+    actions = <>
+      <button type="button" onClick={onDismiss} className="ghost-btn px-4 py-2 rounded-md text-sm">Đóng thông báo</button>
+      <button type="button" onClick={onRetry} className="ink-btn px-4 py-2 rounded-md text-sm font-semibold">Thử lại</button>
+    </>;
+  }
+  return (
+    <div className="snx-pop-wrap" onMouseDown={stop} onClick={stop}>
+      <div className="snx-pop" role="alertdialog" aria-live="assertive" style={{ background: tone.bg, borderColor: tone.bd, color: tone.fg }}>
+        {icon}
+        <p className="snx-pop-title">{title}</p>
+        <p className="snx-pop-body">{body}</p>
+        {actions && <div className="snx-pop-actions">{actions}</div>}
+      </div>
     </div>
   );
 }
@@ -1370,6 +1435,9 @@ function DetailPanel({ student, classStudents, fileId, tab, currentMonth, curren
   const alive = useRef(true);
   useEffect(() => () => { alive.current = false; }, []);
   const requestClose = () => { if (saveSt && saveSt.state !== 'saved') setConfirmLeave(true); else onClose(); };
+  const [popup, setPopup] = useState(false);
+  // Popup đang mở mà hàng chờ tự thử lại thành công → hiện 'Đã lưu' 1.5 giây rồi ẩn
+  useEffect(() => { if (popup && !busy && saveSt && saveSt.state === 'saved') { const t = setTimeout(() => alive.current && setPopup(false), 1500); return () => clearTimeout(t); } }, [popup, busy, saveSt && saveSt.state]);
   // Tự đóng hộp cảnh báo khi hàng chờ đã lưu xong (vd: mạng có lại, tự thử lại thành công)
   useEffect(() => { if (confirmLeave && (!saveSt || saveSt.state === 'saved')) setConfirmLeave(false); }, [confirmLeave, saveSt && saveSt.state]);
   const backdropHandlers = useBackdropClose(requestClose);
@@ -1513,11 +1581,13 @@ ${note}`;
     onSaved(updatedData, undefined, { keepOpen: true });
 
     // 3. Chờ server ghi xong + đọc lại đúng
-    setBusy(true);
+    setBusy(true); setPopup(true);
     const r = await syncQueue.waitFor(taskId);
     if (!alive.current) return;
-    setBusy(false);
-    if (!r.ok) return; // giữ khung, thanh trạng thái hiện lỗi + nút Thử lại
+    if (!r.ok) { setBusy(false); return; } // giữ khung + popup báo lỗi
+    await new Promise(z => setTimeout(z, 1100)); // để GV kịp thấy "Đã lưu"
+    if (!alive.current) return;
+    setBusy(false); setPopup(false);
     const savedAt = (r.result && r.result.updated_at) || nowFormatted;
     onSaved({ ...updatedData, updated_at: savedAt }, andNext && nextStudent ? nextStudent : null);
   };
@@ -1704,6 +1774,7 @@ ${note}`;
         </div>
 
         {/* Footer Action Buttons */}
+        {popup && <SavePopup st={saveSt} kind="feedback" onRetry={() => saveSt && syncQueue.retry(saveSt.id)} onDismiss={() => setPopup(false)} />}
         {confirmLeave && <UnsavedConfirm onWait={() => setConfirmLeave(false)} onLeave={() => { setConfirmLeave(false); onClose(); }} />}
         {view === 'write' && saveSt && (
           <div className="sticky bottom-[73px] px-6 pb-2 bg-[var(--paper)]"><SaveStatusBar st={saveSt} onRetry={() => syncQueue.retry(saveSt.id)} /></div>
@@ -1761,6 +1832,9 @@ function MonthlyDetailPanel({ student, classStudents, fileId, currentMonth, curr
   const alive = useRef(true);
   useEffect(() => () => { alive.current = false; }, []);
   const requestClose = () => { if (saveSt && saveSt.state !== 'saved') setConfirmLeave(true); else onClose(); };
+  const [popup, setPopup] = useState(false);
+  // Popup đang mở mà hàng chờ tự thử lại thành công → hiện 'Đã lưu' 1.5 giây rồi ẩn
+  useEffect(() => { if (popup && !busy && saveSt && saveSt.state === 'saved') { const t = setTimeout(() => alive.current && setPopup(false), 1500); return () => clearTimeout(t); } }, [popup, busy, saveSt && saveSt.state]);
   // Tự đóng hộp cảnh báo khi hàng chờ đã lưu xong (vd: mạng có lại, tự thử lại thành công)
   useEffect(() => { if (confirmLeave && (!saveSt || saveSt.state === 'saved')) setConfirmLeave(false); }, [confirmLeave, saveSt && saveSt.state]);
   const backdropHandlers = useBackdropClose(requestClose);
@@ -1842,11 +1916,13 @@ function MonthlyDetailPanel({ student, classStudents, fileId, currentMonth, curr
     };
     onSaved(updatedData, undefined, { keepOpen: true });
 
-    setBusy(true);
+    setBusy(true); setPopup(true);
     const r = await syncQueue.waitFor(taskId);
     if (!alive.current) return;
-    setBusy(false);
-    if (!r.ok) return;
+    if (!r.ok) { setBusy(false); return; }
+    await new Promise(z => setTimeout(z, 1100));
+    if (!alive.current) return;
+    setBusy(false); setPopup(false);
     onSaved({ ...updatedData, updated_at: (r.result && r.result.updated_at) || nowFormatted }, andNext && nextStudent ? nextStudent : null);
   };
 
@@ -1996,6 +2072,7 @@ function MonthlyDetailPanel({ student, classStudents, fileId, currentMonth, curr
           </div>
         </div>
 
+        {popup && <SavePopup st={saveSt} kind="monthly" onRetry={() => saveSt && syncQueue.retry(saveSt.id)} onDismiss={() => setPopup(false)} />}
         {confirmLeave && <UnsavedConfirm onWait={() => setConfirmLeave(false)} onLeave={() => { setConfirmLeave(false); onClose(); }} />}
         {saveSt && <div className="sticky bottom-[73px] px-6 pb-2 bg-[var(--paper)]"><SaveStatusBar st={saveSt} onRetry={() => syncQueue.retry(saveSt.id)} /></div>}
         <div className="sticky bottom-0 bg-[var(--paper)] border-t border-[var(--line)] px-6 py-4 flex gap-2 items-center">
