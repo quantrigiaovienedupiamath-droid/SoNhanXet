@@ -130,7 +130,7 @@ function render() {
     const last = it.events.length ? it.events[it.events.length - 1].at : first;
     const retried = first && last && (new Date(last) - new Date(first) > 60000);
     const timeCell = esc(fmt(last)) + (retried ? '<div class="muted" style="font-size:11px;margin-top:3px">bấm lần đầu: ' + esc(fmt(first)) + '</div>' : '');
-    return `<tr class="row" data-i="${i}"><td class="mono">${timeCell}</td><td>${esc(it.login)}</td><td>${esc(KIND[it.kind] || it.kind || '')}</td><td class="mono">${esc(it.period)}</td><td>${esc(it.student_name)} <span class="mono muted">${esc(it.student_id)}</span></td><td class="mono">${esc(it.class_code)}</td><td><span class="st ${st.cls}">${esc(st.text)}</span>${(it.mismatch || it.error) && !it.writtenAt ? '<div class="muted" style="font-size:12px;margin-top:4px">' + esc(it.mismatch || it.error) + '</div>' : ''}</td></tr>`;
+    return `<tr class="row" data-i="${i}"><td class="mono">${timeCell}</td><td>${esc(it.login)}</td><td>${esc(KIND[it.kind] || it.kind || '')}</td><td class="mono">${esc(it.period)}</td><td>${esc(it.student_name)} <span class="mono muted">${esc(it.student_id)}</span></td><td class="mono">${esc(it.class_code)}</td><td><span class="st ${st.cls}">${esc(st.text)}</span>${(it.mismatch || (it.error && it.result !== 'ok')) && !it.writtenAt ? '<div class="muted" style="font-size:12px;margin-top:4px">' + esc(it.mismatch || it.error) + '</div>' : ''}</td></tr>`;
   }).join('');
 }
 
