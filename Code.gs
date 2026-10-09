@@ -32,6 +32,9 @@ const TIMEZONE = 'GMT+7';
 const DEADLINE_HOUR = 12;
 const DEADLINE_MINUTE = 0;
 
+// Từ ngày này trong tháng, app mới hiện thêm báo cáo của tháng hiện tại (trước đó chỉ tháng trước)
+const MONTHLY_SHOW_CURRENT_FROM_DAY = 20;
+
 const MONTHLY_HEADERS = [
   'ID Học Sinh',
   'Họ tên học sinh',
@@ -147,8 +150,35 @@ function cacheRemoveLarge_(key) {
   try { CacheService.getScriptCache().remove(key + '__n'); } catch (e) {}
 }
 
+// ── Đo thời gian từng bước của 1 lượt gọi (trả về trong _perf để app hiển thị khi ?debug=1)
+let PERF_ = null;
+function perfMark_(label) {
+  if (PERF_) PERF_.push(label + ' ' + (Date.now() - PERF_.t0) + 'ms');
+}
+
 const SCHEDULES_CACHE_KEY = 'class_schedules_v2';
 const SCHEDULES_CACHE_TTL = 1800; // 30 phút (cron PIC 10h tự xoá cache để đọc lại)
+
+// ============================================================
+// LOG ĐỘC LẬP TRÊN VERCEL: server báo "đã ghi vào Sheet" (GV không làm giả được)
+// Cần Thuộc tính tập lệnh LOG_SECRET (giống biến LOG_SECRET trên Vercel).
+// ============================================================
+const AUDIT_LOG_URL_DEFAULT = 'https://so-nhan-xet-two.vercel.app/api/log';
+function serverAuditLog_(evt) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const secret = props.getProperty('LOG_SECRET');
+    if (!secret) return;
+    const url = props.getProperty('LOG_URL') || AUDIT_LOG_URL_DEFAULT;
+    UrlFetchApp.fetch(url, {
+      method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+      headers: { 'x-log-secret': secret },
+      payload: JSON.stringify({ events: [Object.assign({ serverTime: new Date().toISOString() }, evt)] }),
+    });
+  } catch (e) { Logger.log('serverAuditLog_ lỗi: ' + e); }
+}
+
+function sameVal_(a, b) { return String(a == null ? '' : a).trim() === String(b == null ? '' : b).trim(); }
 
 // ============================================================
 // AUTH
@@ -162,6 +192,7 @@ function hashPw_(pw) {
 // login → [mật khẩu đã băm, email, họ tên, login gốc]; cache 10 phút
 function getAuthMap_() {
   const cached = cacheGetLarge_('auth_map_v1');
+  perfMark_(cached ? 'tài khoản:cache' : 'tài khoản:ĐỌC SHEET…');
   if (cached) { try { return JSON.parse(cached); } catch (e) {} }
   const ss = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
   const sheet = ss.getSheetByName('_Teachers');
@@ -175,6 +206,7 @@ function getAuthMap_() {
     map[lg] = [hashPw_((r[1] || '').toString()), r[2] || '', r[3] || r[0], r[0]];
   }
   cachePutLarge_('auth_map_v1', JSON.stringify(map), 600);
+  perfMark_('tài khoản:đọc xong');
   return map;
 }
 
@@ -199,6 +231,7 @@ function authenticate(login, password) {
 function getTeachersMap() {
   const cache = CacheService.getScriptCache();
   const cached = cache.get('teachers_map');
+  perfMark_(cached ? 'DS GV:cache' : 'DS GV:ĐỌC SHEET…');
   if (cached) return JSON.parse(cached);
 
   const ss = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
@@ -298,6 +331,7 @@ function formatDateTimeGAS(val) {
 // ============================================================
 function loadClassSchedules() {
   const cached = cacheGetLarge_(SCHEDULES_CACHE_KEY);
+  perfMark_(cached ? 'lịch lớp:cache' : 'lịch lớp:ĐỌC SHEET…');
   if (cached) {
     try {
       const parsed = JSON.parse(cached);
@@ -375,6 +409,7 @@ function loadClassSchedules() {
     ];
   }
   cachePutLarge_(SCHEDULES_CACHE_KEY, JSON.stringify(compressed), SCHEDULES_CACHE_TTL);
+  perfMark_('lịch lớp:đọc xong');
   return map;
 }
 
@@ -477,9 +512,11 @@ function loadDashboardData(login, month, year) {
   if (activeWeek && activeWeekFileId) {
     // Chỉ mở 1 file: file chứa tuần đang xem
     const activeSS = SpreadsheetApp.openById(activeWeekFileId);
+    perfMark_('mở file tuần');
     const sheet = activeSS.getSheetByName(activeWeek);
     if (sheet) {
       const data = sheet.getDataRange().getValues();
+      perfMark_('đọc tab tuần (' + data.length + ' dòng)');
       // Chỉ hiển thị học sinh có cột F (teacher_login) khớp với login của GV đang đăng nhập
       // Cột F đã được gán đúng từ aggregateWeekly theo GV chuyên môn dạy Buổi 2
       for (let i = 1; i < data.length; i++) {
@@ -559,6 +596,7 @@ const RENEWAL_CACHE_KEY = 'renewal_ids';
 function loadRenewalSet() {
   const cache = CacheService.getScriptCache();
   const cached = cache.get(RENEWAL_CACHE_KEY);
+  perfMark_(cached !== null ? 'gia hạn:cache' : 'gia hạn:ĐỌC SHEET…');
   if (cached !== null) {
     const set = {};
     cached.split(',').forEach(function(id) { if (id) set[id] = true; });
@@ -905,8 +943,14 @@ function aggregateWeekly(filterMonth, filterYear) {
 
         // Tự động dọn cột H (Đánh giá chung rác) và I/J (Điểm BTVN rác) ngay tại đây,
         // không cần chạy riêng cleanupWrongScores() nữa mỗi lần đồng bộ.
-        sanitizeColumnsHIJ(existing);
-        tab.getRange(1, 1, existing.length, maxLen).setValues(existing);
+        const cleanedRows = sanitizeColumnsHIJ(existing);
+        // CHỈ ghi các cột hệ thống: A–G (thông tin HS, GV, note) và M–N (trạng thái, PIC).
+        // Không ghi lại H–L, O (đánh giá, điểm, nhận xét, mẫu PH, cập nhật lúc) để không bao giờ
+        // đè lên nhận xét GV vừa lưu trong lúc hàm này đang chạy.
+        tab.getRange(1, 1, existing.length, 7).setValues(existing.map(r => r.slice(0, 7)));
+        tab.getRange(1, 13, existing.length, 2).setValues(existing.map(r => [r[12], r[13]]));
+        // Dọn dữ liệu rác cột H–J: chỉ ghi đúng những ô vừa được dọn
+        cleanedRows.forEach(i => tab.getRange(i + 1, 8, 1, 3).setValues([[existing[i][7], existing[i][8], existing[i][9]]]));
       }
 
       applyRowFormatting(tab);
@@ -1257,9 +1301,11 @@ const WRONG_VALUES = [
 // commentColIdx: index 0-based của cột "Nhận xét" trong mảng row đầy đủ (mặc định cột K = 10).
 function sanitizeColumnsHIJ(existing, commentColIdx) {
   commentColIdx = commentColIdx === undefined ? 10 : commentColIdx;
+  const changed = [];
   for (let i = 1; i < existing.length; i++) {
     const row = existing[i];
     if (!row) continue;
+    const before = [row[7], row[8], row[9]].join('|');
 
     // Cột H (index 7) - Đánh giá chung: nếu đang chứa trạng thái điểm danh rác (VD "Học đủ",
     // "Nghỉ"...) thay vì đánh giá thật do GV chọn -> xoá, cố khôi phục lại đánh giá đúng dựa
@@ -1277,7 +1323,9 @@ function sanitizeColumnsHIJ(existing, commentColIdx) {
         row[j] = '';
       }
     }
+    if ([row[7], row[8], row[9]].join('|') !== before) changed.push(i);
   }
+  return changed;
 }
 
 // ── Dọn dẹp dữ liệu sai: xóa trạng thái điểm danh khỏi cột điểm I,J ──
@@ -1505,9 +1553,10 @@ function getSheetNamesCached_(fileId, ssOpt) {
   const key = 'tabs_' + fileId;
   const cache = CacheService.getScriptCache();
   const cached = cache.get(key);
-  if (cached) { try { return JSON.parse(cached); } catch (e) {} }
+  if (cached) { perfMark_('tên tab:cache'); try { return JSON.parse(cached); } catch (e) {} }
   const ss = ssOpt || SpreadsheetApp.openById(fileId);
   const names = ss.getSheets().map(function(sh) { return sh.getName(); });
+  perfMark_('tên tab:mở file');
   try { cache.put(key, JSON.stringify(names), 600); } catch (e) {}
   return names;
 }
@@ -1519,6 +1568,7 @@ function findMonthlyFile(month, year) {
   const cacheKey = 'monthly_file_' + month + '_' + year;
   const cache = CacheService.getScriptCache();
   const cached = cache.get(cacheKey);
+  perfMark_('tìm file T' + month + (cached ? ':cache' : ':DRIVE…'));
   if (cached) {
     const parsed = JSON.parse(cached);
     return parsed.found ? parsed : null;
@@ -1596,12 +1646,14 @@ function getStudentsInWeek(monthlyFileId, tabName, login) {
   if (!teacher) return { error: 'Tài khoản không tồn tại' };
 
   const ss = SpreadsheetApp.openById(monthlyFileId);
+  perfMark_('mở file tuần');
   const sheet = ss.getSheetByName(tabName);
   if (!sheet) return { error: 'Không tìm thấy tab ' + tabName };
 
   const schedules = loadClassSchedules();
 
   const data = sheet.getDataRange().getValues();
+  perfMark_('đọc tab tuần (' + data.length + ' dòng)');
   const students = [];
   const renewalSet = loadRenewalSet();
 
@@ -1652,7 +1704,7 @@ function getStudentsInWeek(monthlyFileId, tabName, login) {
 // ============================================================
 // WRITE feedback
 // ============================================================
-function saveFeedback(monthlyFileId, tabName, rowIndex, feedbackText, parentTemplate, login, scoreB1, scoreB2, statusEvaluation, studentId) {
+function saveFeedback(monthlyFileId, tabName, rowIndex, feedbackText, parentTemplate, login, scoreB1, scoreB2, statusEvaluation, studentId, reqId) {
   const teacher = getTeacherByLogin(login);
   if (!teacher) return { error: 'Tài khoản không tồn tại' };
 
@@ -1719,16 +1771,21 @@ function saveFeedback(monthlyFileId, tabName, rowIndex, feedbackText, parentTemp
   const updatedAt = Utilities.formatDate(new Date(), 'GMT+7', 'dd/MM/yyyy HH:mm');
   
   // ── GHI TRỰC TIẾP: Cột H-L (8-12) và cột O (15), không đọc trước (Tối ưu 100% I/O) ──
-  sheet.getRange(targetRow, 8, 1, 5).setValues([[
-    statusEvaluation || '',
-    scoreB1 || '',
-    scoreB2 || '',
-    feedbackText || '',
-    parentTemplate || ''
-  ]]);
+  const written = [statusEvaluation || '', scoreB1 || '', scoreB2 || '', feedbackText || '', parentTemplate || ''];
+  sheet.getRange(targetRow, 8, 1, 5).setValues([written]);
   sheet.getRange(targetRow, 15, 1, 1).setValue(updatedAt);
-  
-  return { ok: true, updated_at: updatedAt };
+  SpreadsheetApp.flush();
+
+  // Đọc lại để chắc chắn đã ghi đúng (đúng dòng, đúng HS, đúng nội dung)
+  const back = sheet.getRange(targetRow, 1, 1, 15).getValues()[0];
+  const ok = (!studentId || sameVal_(back[1], studentId)) &&
+             sameVal_(back[7], written[0]) && sameVal_(back[8], written[1]) && sameVal_(back[9], written[2]) &&
+             sameVal_(back[10], written[3]);
+  if (!ok) return { error: 'Đã ghi nhưng kiểm tra lại không khớp (dòng ' + targetRow + '). Vui lòng bấm Thử lại.' };
+
+  serverAuditLog_({ event: 'written', reqId: reqId || '', login: login, kind: 'week', fileId: monthlyFileId,
+    period: tabName, row: targetRow, studentId: studentId || back[1], studentName: back[2], classCode: back[4], updatedAt: updatedAt });
+  return { ok: true, updated_at: updatedAt, row: targetRow };
 }
 
 // ============================================================
@@ -3165,12 +3222,14 @@ function getMonthlyStudents(login, month, year) {
     if (!file) return [];
 
     const ss = SpreadsheetApp.openById(file.id);
+    perfMark_('mở file T' + m);
     // Không tự dựng tab Monthly ở đây nữa (rất nặng, làm GV phải chờ lâu).
     // Tab Monthly do cron ngày 28 hoặc menu "Tạo danh sách báo cáo tháng" tạo.
     const tab = ss.getSheetByName('Monthly');
     if (!tab) return [];
 
     const data = tab.getDataRange().getValues();
+    perfMark_('đọc Monthly T' + m + ' (' + data.length + ' dòng)');
     const students = [];
     const rowsToUpdateTeacher = [];
 
@@ -3216,7 +3275,12 @@ function getMonthlyStudents(login, month, year) {
     return students;
   }
 
-  const currentStudents = readFromFile(month, year);
+  // Trước ngày 20: chỉ hiện báo cáo tháng T-1. Từ ngày 20: hiện cả tháng T và T-1.
+  // (Chỉ áp dụng khi đang xem tháng hiện tại; không mở file tháng T khi chưa cần → nhanh hơn)
+  const today = new Date();
+  const isCurrentMonth = (month === today.getMonth() + 1 && year === today.getFullYear());
+  const showCurrent = !isCurrentMonth || today.getDate() >= MONTHLY_SHOW_CURRENT_FROM_DAY;
+  const currentStudents = showCurrent ? readFromFile(month, year) : [];
   const prevStudents    = readFromFile(prev.month, prev.year);
 
   // Tháng T lên đầu, T-1 phía sau
@@ -3232,7 +3296,7 @@ function getMonthlyStudents(login, month, year) {
 /**
  * Lưu báo cáo tháng: frontend truyền student.fileId (không phải cứng file tháng T)
  */
-function saveMonthlyReport(monthlyFileId, rowIndex, payload, login, studentId) {
+function saveMonthlyReport(monthlyFileId, rowIndex, payload, login, studentId, reqId) {
   const teacher = getTeacherByLogin(login);
   if (!teacher) return { error: 'Tài khoản không tồn tại' };
 
@@ -3283,7 +3347,7 @@ function saveMonthlyReport(monthlyFileId, rowIndex, payload, login, studentId) {
 
   const updatedAt = Utilities.formatDate(new Date(), 'GMT+7', 'dd/MM/yyyy HH:mm');
   // ── Ghi 9 cột nhận xét (F-N: 6-14) và cột Cập nhật lúc (P: 16), giữ nguyên cột Word (O: 15) ──
-  tab.getRange(targetRow, 6, 1, 9).setValues([[
+  const written = [
     payload.diem_dat_duoc || '',
     payload.kt_dat || '',
     payload.kt_caithien || '',
@@ -3293,9 +3357,19 @@ function saveMonthlyReport(monthlyFileId, rowIndex, payload, login, studentId) {
     payload.td_caithien || '',
     payload.khac_phuc || '',
     payload.giai_phap || '',
-  ]]);
+  ];
+  tab.getRange(targetRow, 6, 1, 9).setValues([written]);
   tab.getRange(targetRow, 16, 1, 1).setValue(updatedAt);
-  return { ok: true, updated_at: updatedAt };
+  SpreadsheetApp.flush();
+
+  const back = tab.getRange(targetRow, 1, 1, 14).getValues()[0];
+  let ok = !studentId || sameVal_(back[0], studentId);
+  for (let k = 0; k < written.length && ok; k++) ok = sameVal_(back[5 + k], written[k]);
+  if (!ok) return { error: 'Đã ghi nhưng kiểm tra lại không khớp (dòng ' + targetRow + '). Vui lòng bấm Thử lại.' };
+
+  serverAuditLog_({ event: 'written', reqId: reqId || '', login: login, kind: 'month', fileId: monthlyFileId,
+    period: 'Monthly', row: targetRow, studentId: studentId || back[0], studentName: back[1], classCode: back[2], updatedAt: updatedAt });
+  return { ok: true, updated_at: updatedAt, row: targetRow };
 }
 
 /**
@@ -4056,6 +4130,7 @@ function runAggregateNow() {
 // ============================================================
 function doPost(e) {
   try {
+    PERF_ = []; PERF_.t0 = Date.now();
     const requestData = JSON.parse(e.postData.contents);
     const action = requestData.action;
     const args = requestData.args || [];
@@ -4068,7 +4143,7 @@ function doPost(e) {
     } else if (action === 'getStudentsInWeek') {
       result = getStudentsInWeek(args[0], args[1], args[2]);
     } else if (action === 'saveFeedback') {
-      result = saveFeedback(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9]);
+      result = saveFeedback(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10]);
     } else if (action === 'getStudentHistory') {
       result = getStudentHistory(args[0], args[1], args[2], args[3]);
     } else if (action === 'getAiSuggestion') {
@@ -4078,7 +4153,7 @@ function doPost(e) {
     } else if (action === 'getMonthlyStudents') {
       result = getMonthlyStudents(args[0], args[1], args[2]);
     } else if (action === 'saveMonthlyReport') {
-      result = saveMonthlyReport(args[0], args[1], args[2], args[3], args[4]);
+      result = saveMonthlyReport(args[0], args[1], args[2], args[3], args[4], args[5]);
     } else if (action === 'exportMonthlyReportToWord') {
       result = exportMonthlyReportToWord(args[0], args[1], args[2], args[3], args[4], args[5]);
     } else if (action === 'getAiMonthlySuggestion') {
@@ -4087,6 +4162,9 @@ function doPost(e) {
       result = { error: 'Không tìm thấy hành động: ' + action };
     }
     
+    if (result && typeof result === 'object' && !Array.isArray(result)) {
+      result._perf = { ms: Date.now() - PERF_.t0, steps: PERF_.slice() };
+    }
     return ContentService.createTextOutput(JSON.stringify(result))
       .setMimeType(ContentService.MimeType.JSON);
   } catch (error) {
@@ -4452,4 +4530,120 @@ function fixCurrentWeekPic() {
     Logger.log('   → Hãy điền cột PIC/PIC GVCN vào sheet "Danh sách lớp Edupia Math" rồi chạy lại');
   }
   Logger.log('=== XONG ===');
+}
+// ============================================================
+// KIỂM TRA DỮ LIỆU 1 LỚP / 1 GV (CHỈ ĐỌC, không sửa gì)
+// Cách chạy: trong Apps Script chọn hàm debugClassRun → ▶ Chạy → xem "Nhật ký thực thi".
+// Đổi 2 giá trị bên dưới cho lớp / GV cần kiểm tra.
+// ============================================================
+function debugClassRun() {
+  debugClassData_('R.MA.6P.7C.001173', 'hangnt.math');
+}
+
+function debugClassData_(classCode, login) {
+  const cls = normalizeClassCode(classCode);
+  const me = (login || '').toLowerCase().trim();
+  const out = [];
+  const log = s => { out.push(s); };
+  const now = new Date();
+  const cur = { m: now.getMonth() + 1, y: now.getFullYear() };
+  const prv = getPrevMonth(cur.m, cur.y);
+  const months = [{ m: prv.month, y: prv.year }, cur];
+
+  // 1. Lịch lớp
+  try { cacheRemoveLarge_(SCHEDULES_CACHE_KEY); } catch (e) {}
+  const sched = loadClassSchedules()[cls];
+  log('=== LỚP ' + cls + ' | GV kiểm tra: ' + me + ' ===');
+  log('1) Danh sách lớp: ' + (sched ? ('GV phụ trách=' + sched.teacher_login + ' | B1=' + sched.day1 + ' | B2=' + sched.day2) : 'KHÔNG TÌM THẤY lớp trong "Danh sách lớp Edupia Math"'));
+
+  // 2. GV dạy thực tế theo LMS (_DailySessions)
+  const daily = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID).getSheetByName('_DailySessions').getDataRange().getValues();
+  const byDate = {};
+  for (let i = 1; i < daily.length; i++) {
+    const r = daily[i];
+    if (normalizeClassCode(r[3]) !== cls) continue;
+    const d = parseVNDate(r[0]); if (!d) continue;
+    if (!months.some(x => x.m === d.getMonth() + 1 && x.y === d.getFullYear())) continue;
+    const k = Utilities.formatDate(d, 'GMT+7', 'dd/MM');
+    byDate[k] = byDate[k] || {};
+    const t = (r[5] || '(trống)').toString().toLowerCase();
+    byDate[k][t] = (byDate[k][t] || 0) + 1;
+  }
+  log('2) GV dạy theo LMS (_DailySessions) từng ngày:');
+  Object.keys(byDate).forEach(k => log('   ' + k + ': ' + Object.keys(byDate[k]).map(t => t + (t === me ? ' ✅' : ' ⚠️') + ' (' + byDate[k][t] + ' HS)').join(', ')));
+
+  // 3. Tab tuần + 4. Monthly
+  months.forEach(mo => {
+    const f = findMonthlyFile(mo.m, mo.y);
+    if (!f) { log('— Không có file Nhận xét tháng ' + mo.m + '/' + mo.y); return; }
+    const ss = SpreadsheetApp.openById(f.id);
+    ss.getSheets().forEach(sh => {
+      const name = sh.getName();
+      const data = sh.getDataRange().getValues();
+      if (name === 'Monthly') {
+        const rows = data.slice(1).map((r, i) => ({ r, row: i + 2 })).filter(x => normalizeClassCode(x.r[2]) === cls);
+        if (!rows.length) { log('4) Monthly ' + mo.m + '/' + mo.y + ': không có HS của lớp này'); return; }
+        log('4) Monthly ' + mo.m + '/' + mo.y + ' (' + rows.length + ' HS):');
+        rows.forEach(x => {
+          const t = (x.r[4] || '(trống)').toString().toLowerCase();
+          const done = !!(x.r[6] || x.r[8] || x.r[10]);
+          log('   dòng ' + x.row + ' | ' + x.r[0] + ' ' + x.r[1] + ' | GV cột E=' + t + (t === me ? ' ✅' : ' ⚠️') + ' | ' + (done ? 'CÓ báo cáo' : 'chưa có báo cáo') + ' | cập nhật=' + (x.r[15] || '-'));
+        });
+        return;
+      }
+      if (name.startsWith('_') || !/(\d+)\/(\d+)\s*-\s*(\d+)\/(\d+)/.test(name)) return;
+      const rows = data.slice(1).map((r, i) => ({ r, row: i + 2 })).filter(x => normalizeClassCode(x.r[4]) === cls);
+      if (!rows.length) return;
+      const teachers = {};
+      rows.forEach(x => { const t = (x.r[5] || '(trống)').toString().toLowerCase(); teachers[t] = (teachers[t] || 0) + 1; });
+      const withNote = rows.filter(x => (x.r[10] || '').toString().trim()).length;
+      log('3) Tab tuần "' + name + '" (file T' + mo.m + '): ' + rows.length + ' HS, ' + withNote + ' HS có nhận xét | GV cột F: ' + Object.keys(teachers).map(t => t + (t === me ? ' ✅' : ' ⚠️') + '×' + teachers[t]).join(', '));
+      rows.forEach(x => {
+        const note = (x.r[10] || '').toString().trim();
+        if (note || (x.r[5] || '').toString().toLowerCase() !== me) {
+          log('     dòng ' + x.row + ' | ' + x.r[1] + ' ' + x.r[2] + ' | GV=' + x.r[5] + ' | NX=' + (note ? '"' + note.slice(0, 40) + '…"' : '(trống)') + ' | cập nhật=' + formatDateTimeGAS(x.r[14]));
+        }
+      });
+    });
+  });
+  log('✅ = đúng GV đang kiểm tra (GV thấy được trên app) · ⚠️ = đang gán cho GV khác (GV kiểm tra KHÔNG thấy)');
+  Logger.log(out.join('\n'));
+  return out.join('\n');
+}
+
+// ============================================================
+// KIỂM TRA TOÀN HỆ THỐNG: từ ngày nào thì không còn ai lưu được? (CHỈ ĐỌC)
+// Chạy hàm debugSaveHealth → xem Nhật ký thực thi.
+// ============================================================
+function debugSaveHealth() {
+  const out = [];
+  const now = new Date();
+  const prv = getPrevMonth(now.getMonth() + 1, now.getFullYear());
+  const months = [{ m: prv.month, y: prv.year }, { m: now.getMonth() + 1, y: now.getFullYear() }];
+  const toKey = v => {
+    const s = formatDateTimeGAS(v); const m = s.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+    return m ? m[3] + '-' + m[2] + '-' + m[1] : null;
+  };
+  months.forEach(mo => {
+    const f = findMonthlyFile(mo.m, mo.y);
+    if (!f) return;
+    const ss = SpreadsheetApp.openById(f.id);
+    ss.getSheets().forEach(sh => {
+      const name = sh.getName();
+      const isMonthly = name === 'Monthly';
+      if (!isMonthly && (name.startsWith('_') || !/(\d+)\/(\d+)\s*-\s*(\d+)\/(\d+)/.test(name))) return;
+      const data = sh.getDataRange().getValues();
+      const updCol = isMonthly ? 15 : 14;
+      const perDay = {}; let filled = 0;
+      for (let i = 1; i < data.length; i++) {
+        const has = isMonthly ? !!(data[i][6] || data[i][8] || data[i][10]) : !!(data[i][10] || '').toString().trim();
+        if (has) filled++;
+        const k = toKey(data[i][updCol]);
+        if (k) perDay[k] = (perDay[k] || 0) + 1;
+      }
+      const days = Object.keys(perDay).sort().slice(-8).map(k => k.slice(8) + '/' + k.slice(5, 7) + ':' + perDay[k]);
+      out.push((isMonthly ? 'MONTHLY ' : 'Tuần ') + name + ' (T' + mo.m + '): ' + filled + '/' + (data.length - 1) + ' dòng có dữ liệu | số lần lưu theo ngày (8 ngày gần nhất): ' + (days.join('  ') || 'không có'));
+    });
+  });
+  Logger.log(out.join('\n'));
 }

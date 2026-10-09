@@ -155,7 +155,7 @@ function callApi(method, ...args) {
     catch(e) { throw new Error('Lỗi định dạng dữ liệu: ' + text.substring(0, 100)); }
     const serverPerf = data._perf; delete data._perf;
     recordPerf(method, performance.now() - perfT0, serverPerf, data.error ? 'lỗi' : '');
-    if (data.error) throw new Error(data.error);
+    if (data.error) { const er = new Error(data.error); er.isServer = true; throw er; }
     const finalResult = data.result !== undefined ? data.result : data;
     if (CACHEABLE_METHODS.includes(method)) {
       cacheSet(cacheKey, finalResult);
@@ -188,186 +188,263 @@ function clearDraft(key) {
   try { sessionStorage.removeItem('draft_' + key); } catch(e) {}
 }
 
-// ── Background Sync Queue Manager ────────────────────────────
+// ── Log độc lập trên Vercel (không phụ thuộc Google) ──────────
+// Mỗi lần lưu ghi lại: GV bấm lưu (attempt) → kết quả (result). Server Apps Script
+// ghi thêm "đã ghi vào Sheet" (written). Log nằm trong hộp thư chờ trên máy cho tới
+// khi gửi được, nên mất mạng vẫn không mất log.
+const LOG_BASE = (/^https?:$/.test(location.protocol) && !/googleusercontent|script\.google/.test(location.hostname))
+  ? '' : 'https://so-nhan-xet-two.vercel.app';
+const LOG_OUTBOX_KEY = 'snx_log_outbox';
+function readJSON(key, fallback) { try { const v = JSON.parse(localStorage.getItem(key)); return v == null ? fallback : v; } catch (e) { return fallback; } }
+function writeJSON(key, v) { try { localStorage.setItem(key, JSON.stringify(v)); } catch (e) {} }
+function auditLog(evt) {
+  const box = readJSON(LOG_OUTBOX_KEY, []);
+  box.push({ ...evt, clientTime: new Date().toISOString() });
+  writeJSON(LOG_OUTBOX_KEY, box.slice(-1000));
+  setTimeout(flushAuditLog, 0);
+}
+let auditFlushing = false;
+async function flushAuditLog() {
+  if (auditFlushing) return;
+  const box = readJSON(LOG_OUTBOX_KEY, []);
+  if (!box.length) return;
+  auditFlushing = true;
+  try {
+    const batch = box.slice(0, 100);
+    const body = JSON.stringify({ events: batch });
+    const res = await fetch(LOG_BASE + '/api/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, keepalive: body.length < 60000 });
+    if (res.ok) writeJSON(LOG_OUTBOX_KEY, readJSON(LOG_OUTBOX_KEY, []).slice(batch.length));
+  } catch (e) {}
+  auditFlushing = false;
+  if (readJSON(LOG_OUTBOX_KEY, []).length && navigator.onLine) setTimeout(flushAuditLog, 15000);
+}
+window.addEventListener('online', flushAuditLog);
+setInterval(flushAuditLog, 60000);
+
+// ── Hàng chờ lưu ──────────────────────────────────────────────
+// - Mỗi lần lưu được giữ trên máy (localStorage) cho tới khi server XÁC NHẬN đã ghi
+//   và đọc lại đúng → mới xoá. Không bao giờ âm thầm bỏ cuộc.
+// - Lỗi mạng: tự thử lại mãi (5s, 15s, 30s, 60s, 2 phút…), kể cả khi mở lại app.
+// - Lỗi do server từ chối (vd không có quyền): dừng lại, báo đỏ, chờ GV/Admin bấm Thử lại.
+// state: 'pending' | 'sending' | 'error' (lỗi mạng, sẽ tự thử lại) | 'failed' (server từ chối)
+const QUEUE_KEY = 'snx_sync_queue';
+const RETRY_DELAYS = [5000, 15000, 30000, 60000, 120000];
 class SyncQueueManager {
   constructor() {
-    this.queue = [];
+    this.queue = readJSON(QUEUE_KEY, []).map(t => ({ ...t, state: t.state === 'failed' ? 'failed' : 'pending' }));
     this.listeners = new Set();
+    this.waiters = {};       // id → [fn] (chờ kết quả lần gửi gần nhất)
+    this.done = {};          // key học sinh → { at, row } (đã lưu xong trong phiên)
     this.isProcessing = false;
-    this.status = 'idle'; // 'idle' | 'syncing' | 'error' | 'offline'
-    this.lastError = null;
-    this.loadQueue();
-
-    window.addEventListener('online', () => {
-      this.status = 'idle';
-      this.notify();
-      this.process();
-    });
-    window.addEventListener('offline', () => {
-      this.status = 'offline';
-      this.notify();
-    });
+    this.retryTimer = null;
+    window.addEventListener('online', () => { this.notify(); this.process(); });
+    window.addEventListener('offline', () => this.notify());
   }
-
-  loadQueue() {
-    try {
-      const raw = localStorage.getItem('snx_sync_queue');
-      if (raw) {
-        this.queue = JSON.parse(raw) || [];
-      }
-    } catch(e) {
-      this.queue = [];
-    }
+  static keyOf(t) {
+    return t.type === 'feedback'
+      ? 'fb|' + t.fileId + '|' + t.tab + '|' + t.studentId
+      : 'mo|' + t.fileId + '|' + t.studentId;
   }
-
-  saveQueue() {
-    try {
-      localStorage.setItem('snx_sync_queue', JSON.stringify(this.queue));
-    } catch(e) {}
-  }
-
-  subscribe(listener) {
-    this.listeners.add(listener);
-    listener({ status: this.status, count: this.queue.length, lastError: this.lastError });
-    return () => this.listeners.delete(listener);
-  }
-
-  notify() {
-    this.listeners.forEach(fn => fn({
-      status: this.status,
+  save() { writeJSON(QUEUE_KEY, this.queue.map(t => ({ ...t, state: t.state === 'sending' ? 'pending' : t.state }))); }
+  subscribe(fn) { this.listeners.add(fn); fn(this.summary()); return () => this.listeners.delete(fn); }
+  summary() {
+    return {
+      pending: this.queue.filter(t => t.state !== 'failed').length,
+      failed: this.queue.filter(t => t.state === 'failed').length,
+      erroring: this.queue.filter(t => t.state === 'error').length,
+      offline: !navigator.onLine,
       count: this.queue.length,
-      lastError: this.lastError
-    }));
+      lastError: (this.queue.find(t => t.lastError) || {}).lastError || null,
+    };
+  }
+  notify() { const s = this.summary(); this.listeners.forEach(fn => fn(s)); }
+  hasUnsaved() { return this.queue.length > 0; }
+
+  // Trạng thái lưu của 1 học sinh: null | {state, lastError} | {state:'saved', at}
+  statusFor(type, fileId, tab, studentId) {
+    const key = SyncQueueManager.keyOf({ type, fileId, tab, studentId });
+    const t = this.queue.find(x => SyncQueueManager.keyOf(x) === key);
+    if (t) return { state: t.state, lastError: t.lastError, id: t.id };
+    return this.done[key] ? { state: 'saved', ...this.done[key] } : null;
   }
 
-  enqueueFeedback(payload) {
-    const existingIdx = this.queue.findIndex(item =>
-      item.type === 'feedback' &&
-      item.studentId === payload.studentId &&
-      item.tab === payload.tab &&
-      item.fileId === payload.fileId
-    );
-
+  enqueue(type, payload) {
     const task = {
-      id: 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
-      type: 'feedback',
-      ...payload,
-      retryCount: 0,
-      createdAt: Date.now()
+      id: 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6),
+      type, ...payload, attempts: 0, state: 'pending', lastError: null, createdAt: Date.now(),
     };
-
-    if (existingIdx >= 0) {
-      this.queue[existingIdx] = task;
-    } else {
-      this.queue.push(task);
-    }
-    this.saveQueue();
+    const key = SyncQueueManager.keyOf(task);
+    const old = this.queue.find(x => SyncQueueManager.keyOf(x) === key);
+    if (old && old.state !== 'sending') this.queue = this.queue.filter(x => x !== old);
+    this.queue.push(task);
+    delete this.done[key];
+    this.save();
+    auditLog({
+      event: 'attempt', reqId: task.id, login: task.teacherLogin, kind: type === 'feedback' ? 'week' : 'month',
+      fileId: task.fileId, period: type === 'feedback' ? task.tab : task.monthLabel, row: task.rowIndex,
+      studentId: task.studentId, studentName: task.studentName, classCode: task.classCode,
+      content: type === 'feedback'
+        ? { danh_gia: task.statusEvaluation, diem_b1: task.scoreB1, diem_b2: task.scoreB2, nhan_xet: task.note }
+        : task.fields,
+    });
     this.notify();
     this.process();
+    return task.id;
+  }
+  enqueueFeedback(payload) { return this.enqueue('feedback', payload); }
+  enqueueMonthly(payload) { return this.enqueue('monthly', payload); }
+
+  // Chờ kết quả lần gửi tiếp theo của 1 task: {ok:true, result} | {ok:false, error, permanent}
+  waitFor(id) {
+    return new Promise(resolve => {
+      const t = this.queue.find(x => x.id === id);
+      if (!t) return resolve({ ok: true });
+      (this.waiters[id] = this.waiters[id] || []).push(resolve);
+    });
+  }
+  settle(id, outcome) { (this.waiters[id] || []).forEach(fn => fn(outcome)); delete this.waiters[id]; }
+
+  retry(id) {
+    this.queue.forEach(t => { if (!id || t.id === id) { t.state = 'pending'; t.attempts = 0; } });
+    this.save(); this.notify(); this.process(true);
+  }
+  retryNow() { this.retry(null); }
+
+  scheduleRetry(delay) {
+    clearTimeout(this.retryTimer);
+    this.retryTimer = setTimeout(() => this.process(true), delay);
   }
 
-  enqueueMonthly(payload) {
-    const existingIdx = this.queue.findIndex(item =>
-      item.type === 'monthly' &&
-      item.studentId === payload.studentId &&
-      item.fileId === payload.fileId
-    );
-
-    const task = {
-      id: 'task_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
-      type: 'monthly',
-      ...payload,
-      retryCount: 0,
-      createdAt: Date.now()
-    };
-
-    if (existingIdx >= 0) {
-      this.queue[existingIdx] = task;
-    } else {
-      this.queue.push(task);
-    }
-    this.saveQueue();
-    this.notify();
-    this.process();
-  }
-
-  async process() {
-    if (this.isProcessing || this.queue.length === 0) return;
-    if (!navigator.onLine) {
-      this.status = 'offline';
-      this.notify();
-      return;
-    }
-
+  async process(force) {
+    if (this.isProcessing) return;
+    if (!navigator.onLine) { this.notify(); return; }
     this.isProcessing = true;
-    this.status = 'syncing';
-    this.notify();
-
-    while (this.queue.length > 0) {
-      const task = this.queue[0];
+    let minDelay = null;
+    const now = Date.now();
+    for (const task of this.queue.slice()) {
+      if (task.state === 'failed' || !this.queue.includes(task)) continue;
+      if (!force && task.nextTryAt && task.nextTryAt > now) { minDelay = Math.min(minDelay ?? 1e9, task.nextTryAt - now); continue; }
+      task.state = 'sending'; this.notify();
       try {
-        if (task.type === 'feedback') {
-          await callApi(
-            'saveFeedback',
-            task.fileId,
-            task.tab,
-            task.rowIndex,
-            task.note,
-            task.parentTemplate,
-            task.teacherLogin,
-            task.scoreB1,
-            task.scoreB2,
-            task.statusEvaluation,
-            task.studentId
-          );
-        } else if (task.type === 'monthly') {
-          await callApi(
-            'saveMonthlyReport',
-            task.fileId,
-            task.rowIndex,
-            task.fields,
-            task.teacherLogin,
-            task.studentId
-          );
-        }
-
-        this.queue.shift();
-        this.saveQueue();
-        this.lastError = null;
-        this.notify();
+        const res = task.type === 'feedback'
+          ? await callApi('saveFeedback', task.fileId, task.tab, task.rowIndex, task.note, task.parentTemplate,
+              task.teacherLogin, task.scoreB1, task.scoreB2, task.statusEvaluation, task.studentId, task.id)
+          : await callApi('saveMonthlyReport', task.fileId, task.rowIndex, task.fields, task.teacherLogin, task.studentId, task.id);
+        // Thành công (server đã ghi + đọc lại đúng)
+        this.queue = this.queue.filter(x => x !== task);
+        this.done[SyncQueueManager.keyOf(task)] = { at: (res && res.updated_at) || formatDateTimeDisplay(new Date()), row: res && res.row };
+        this.save();
+        auditLog({ event: 'result', reqId: task.id, login: task.teacherLogin, studentId: task.studentId, status: 'ok', row: res && res.row, updatedAt: res && res.updated_at });
+        this.settle(task.id, { ok: true, result: res });
       } catch (err) {
-        console.error('Lỗi khi đồng bộ ngầm:', err);
-        task.retryCount = (task.retryCount || 0) + 1;
-        if (task.retryCount >= 3) {
-          this.status = 'error';
-          this.lastError = err.message || 'Lỗi kết nối khi đồng bộ';
-          this.notify();
-          this.isProcessing = false;
-          return;
+        const msg = (err && err.message) || 'Lỗi không xác định';
+        task.attempts = (task.attempts || 0) + 1;
+        task.lastError = msg;
+        if (err && err.isServer) {
+          task.state = 'failed';            // server từ chối → không tự thử lại
+        } else {
+          task.state = 'error';             // lỗi mạng / quá thời gian → tự thử lại
+          const d = RETRY_DELAYS[Math.min(task.attempts - 1, RETRY_DELAYS.length - 1)];
+          task.nextTryAt = Date.now() + d;
+          minDelay = Math.min(minDelay ?? 1e9, d);
         }
-        await new Promise(r => setTimeout(r, 2500));
+        this.save();
+        auditLog({ event: 'result', reqId: task.id, login: task.teacherLogin, studentId: task.studentId, status: task.state, error: msg, attempt: task.attempts });
+        this.settle(task.id, { ok: false, error: msg, permanent: task.state === 'failed' });
       }
-    }
-
-    this.isProcessing = false;
-    this.status = 'idle';
-    this.notify();
-  }
-
-  retryNow() {
-    if (this.queue.length > 0) {
-      this.queue.forEach(t => { t.retryCount = 0; });
-      this.status = 'idle';
-      this.lastError = null;
       this.notify();
-      this.process();
     }
+    this.isProcessing = false;
+    this.notify();
+    if (minDelay != null) this.scheduleRetry(minDelay);
   }
+}
+
+// Hook: vẽ lại component mỗi khi hàng chờ thay đổi
+function useSyncQueueVersion() {
+  const [, setV] = useState(0);
+  useEffect(() => syncQueue.subscribe(() => setV(v => v + 1)), []);
+}
+
+// Nhãn trạng thái lưu nhỏ trên thẻ học sinh
+function SaveStateTag({ st }) {
+  if (!st || st.state === 'saved') return null;
+  const map = {
+    pending: ['⏳ Đang lưu', '#1d4ed8', '#eff6ff', '#bfdbfe'],
+    sending: ['⏳ Đang lưu', '#1d4ed8', '#eff6ff', '#bfdbfe'],
+    error:   ['⚠️ Chưa lưu · đang thử lại', '#b54708', '#fff7ed', '#fed7aa'],
+    failed:  ['⚠️ Chưa lưu được', '#9a1f1f', '#fef2f2', '#fecaca'],
+  };
+  const [text, color, bg, border] = map[st.state] || map.pending;
+  return <span title={st.lastError || ''} style={{display:'inline-block',marginTop:6,fontSize:11,fontWeight:600,color,background:bg,border:'1px solid ' + border,padding:'2px 8px',borderRadius:999}}>{text}</span>;
+}
+
+// Thanh trạng thái lưu trong khung nhận xét
+function SaveStatusBar({ st, onRetry }) {
+  if (!st) return null;
+  const base = {borderRadius:8,padding:'10px 14px',fontSize:13,display:'flex',alignItems:'center',gap:10,justifyContent:'space-between'};
+  if (st.state === 'saved') return <div style={{...base,background:'rgba(58,141,147,0.10)',border:'1px solid rgba(58,141,147,0.35)',color:'var(--good)'}}><span>✓ <strong>Đã lưu vào Sheet</strong>{st.at ? ' lúc ' + st.at : ''}</span></div>;
+  if (st.state === 'pending' || st.state === 'sending') return <div style={{...base,background:'#eff6ff',border:'1px solid #bfdbfe',color:'#1d4ed8'}}><span>⏳ <strong>Đang lưu vào Sheet…</strong> Vui lòng chờ, đừng đóng trình duyệt.</span></div>;
+  const failed = st.state === 'failed';
+  return (
+    <div style={{...base,background:failed?'#fef2f2':'#fff7ed',border:'1px solid ' + (failed?'#fecaca':'#fed7aa'),color:failed?'#9a1f1f':'#b54708'}}>
+      <span>⚠️ <strong>Chưa lưu được vào Sheet.</strong> {st.lastError ? 'Lý do: ' + st.lastError + '.' : ''} {failed ? 'Bấm Thử lại; nếu vẫn lỗi hãy báo Admin.' : 'Hệ thống đang tự thử lại.'} Nhận xét vẫn được giữ trên máy này.</span>
+      <button type="button" onClick={onRetry} className="ghost-btn px-3 py-1.5 rounded-md text-xs font-medium" style={{whiteSpace:'nowrap'}}>Thử lại</button>
+    </div>
+  );
+}
+
+// Hộp xác nhận khi thoát lúc chưa lưu xong
+function UnsavedConfirm({ onWait, onLeave }) {
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(19,56,73,0.35)',display:'grid',placeItems:'center',zIndex:60}} onClick={e => e.stopPropagation()}>
+      <div className="paper-card rounded-lg p-6" style={{maxWidth:420,margin:16}}>
+        <p className="font-display text-lg font-semibold mb-2">Nhận xét chưa lưu xong vào Sheet</p>
+        <p className="text-sm text-[var(--muted)] mb-4">Nếu thoát bây giờ, nhận xét vẫn được giữ trên máy này và tự gửi lại, nhưng sẽ hiện nhãn "Chưa lưu" cho tới khi gửi được. Đừng xoá dữ liệu trình duyệt.</p>
+        <div className="flex gap-2 justify-end">
+          <button type="button" onClick={onLeave} className="ghost-btn px-4 py-2 rounded-md text-sm">Vẫn thoát</button>
+          <button type="button" onClick={onWait} className="ink-btn px-4 py-2 rounded-md text-sm font-semibold">Ở lại chờ lưu</button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 const syncQueue = new SyncQueueManager();
 // Mở app mà còn nhận xét chưa gửi xong từ lần trước → gửi tiếp ngay
-setTimeout(() => syncQueue.process(), 1500);
+setTimeout(() => { syncQueue.process(true); flushAuditLog(); }, 1500);
+// Đóng tab/trình duyệt khi còn bài chưa lưu → trình duyệt hỏi lại
+window.addEventListener('beforeunload', e => { if (syncQueue.hasUnsaved()) { e.preventDefault(); e.returnValue = ''; } });
+
+function SyncStatusBadge() {
+  const [st, setSt] = useState(syncQueue.summary());
+  useEffect(() => syncQueue.subscribe(setSt), []);
+  if (st.failed > 0 || st.erroring > 0) {
+    return (
+      <button onClick={() => syncQueue.retryNow()} className="flex items-center gap-1.5 px-3 py-1 bg-rose-50 border border-rose-300 text-rose-900 rounded-full text-xs font-mono hover:bg-rose-100 transition-colors cursor-pointer" title={st.lastError || 'Bấm để thử lưu lại'}>
+        <span>⚠️ {st.failed + st.erroring} bài chưa lưu · Thử lại ↻</span>
+      </button>
+    );
+  }
+  if (st.offline && st.count > 0) {
+    return <div className="flex items-center gap-1.5 px-3 py-1 bg-amber-50 border border-amber-300 text-amber-900 rounded-full text-xs font-mono"><span>⚠️ Mất mạng · {st.count} bài chờ lưu</span></div>;
+  }
+  if (st.pending > 0) {
+    return (
+      <div className="flex items-center gap-2 px-3 py-1 bg-[#4fb1b8]/10 border border-[#4fb1b8]/30 text-[#133849] rounded-full text-xs font-mono animate-pulse">
+        <span className="inline-block w-2 h-2 rounded-full bg-[#4fb1b8]"></span>
+        <span>⏳ Đang lưu ({st.pending})...</span>
+      </div>
+    );
+  }
+  return (
+    <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-0.5 bg-emerald-50/70 border border-emerald-300/70 text-emerald-800 rounded-full text-[11px] font-mono">
+      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+      <span>Đã lưu hết vào Sheet</span>
+    </div>
+  );
+}
+
 
 // ── Ảnh chụp dữ liệu (hiện ngay khi mở app, cập nhật ngầm sau) ──
 const SNAP_MAX_AGE = 3 * 24 * 3600 * 1000; // 3 ngày
@@ -417,47 +494,6 @@ function applyPendingMonthly(list) {
     return { ...s, ...f, is_done: !!(f.kt_dat || f.kn_dat || f.td_dat) };
   });
 }
-
-function SyncStatusBadge() {
-  const [syncState, setSyncState] = useState({ status: 'idle', count: 0, lastError: null });
-
-  useEffect(() => {
-    return syncQueue.subscribe(setSyncState);
-  }, []);
-
-  if (syncState.status === 'syncing' || syncState.count > 0) {
-    return (
-      <div className="flex items-center gap-2 px-3 py-1 bg-[#4fb1b8]/10 border border-[#4fb1b8]/30 text-[#133849] rounded-full text-xs font-mono animate-pulse">
-        <span className="inline-block w-2 h-2 rounded-full bg-[#4fb1b8]"></span>
-        <span>🔄 Đang lưu ({syncState.count})...</span>
-      </div>
-    );
-  }
-
-  if (syncState.status === 'offline') {
-    return (
-      <div className="flex items-center gap-1.5 px-3 py-1 bg-amber-50 border border-amber-300 text-amber-900 rounded-full text-xs font-mono" title="Dữ liệu đã lưu trên trình duyệt, sẽ tự động đồng bộ khi có mạng">
-        <span>⚠️ Ngoại tuyến ({syncState.count})</span>
-      </div>
-    );
-  }
-
-  if (syncState.status === 'error') {
-    return (
-      <button onClick={() => syncQueue.retryNow()} className="flex items-center gap-1.5 px-3 py-1 bg-rose-50 border border-rose-300 text-rose-900 rounded-full text-xs font-mono hover:bg-rose-100 transition-colors cursor-pointer" title="Bấm để thử đồng bộ lại">
-        <span>⚠️ Chưa đồng bộ ({syncState.count}) · Thử lại ↻</span>
-      </button>
-    );
-  }
-
-  return (
-    <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-0.5 bg-emerald-50/70 border border-emerald-300/70 text-emerald-800 rounded-full text-[11px] font-mono">
-      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-      <span>Đã đồng bộ</span>
-    </div>
-  );
-}
-
 
 function formatDateTimeDisplay(val) {
   if (!val) return '';
@@ -634,6 +670,7 @@ function App() {
   const [selected, setSelected] = useState(null);
   const [toast, setToast] = useState(null);
   const [quickFilter, setQuickFilter] = useState('all'); // 'all' | 'renew' | 'done'
+  useSyncQueueVersion(); // vẽ lại nhãn "Đang lưu / Chưa lưu" trên thẻ
   const [mainTab, setMainTab] = useState('week');
   const [monthlyStudents, setMonthlyStudents] = useState([]);
   const [monthlyFile, setMonthlyFile] = useState(null);
@@ -1046,6 +1083,7 @@ const reportTargetYear  = currentYear;
                               {s.attendance_status === 'Nghỉ B1 (chờ xác nhận B2)' && <span className="ml-2 px-2 py-0.5 bg-amber-100 text-amber-800 rounded-full text-[10px] font-semibold">Nghỉ B1 · chờ B2</span>}
                             </p>
                             {s.note && <p className="text-xs mt-2 italic" style={{color:s.is_gifted?'#854F0B':'var(--muted)'}}>{s.note}</p>}
+                            <SaveStateTag st={syncQueue.statusFor('feedback', activeWeekFileId, activeWeek, s.student_id)} />
                               <div className="flex items-center gap-3 mt-3 flex-wrap">
                                 <div>
                                   <div className="text-[10px] font-mono uppercase text-[var(--muted)] mb-1">Điểm BTVN B1</div>
@@ -1195,6 +1233,7 @@ const reportTargetYear  = currentYear;
                                         <h3 className="font-display font-semibold text-lg leading-tight pr-12">{s.full_name}</h3>
                                         <p className="text-xs text-[var(--muted)] font-mono mt-0.5">ID: {s.student_id}</p>
                                         <p className="text-xs text-[var(--muted)] font-mono mt-1">Bắt đầu: {s.start_date}</p>
+                                        <SaveStateTag st={syncQueue.statusFor('monthly', s.fileId, null, s.student_id)} />
                                         {s.word_url && (
                                           <a href={s.word_url} target="_blank" onClick={e => e.stopPropagation()}
                                             className="inline-block mt-2 text-xs font-mono text-[var(--accent)] hover:underline">
@@ -1235,16 +1274,17 @@ const reportTargetYear  = currentYear;
             teacherLogin={teacher.login}
             onClose={() => setSelected(null)}
             onSelectStudent={(nextSt) => setSelected(nextSt)}
-            onSaved={(updatedFields, nextSt) => {
+            onSaved={(updatedFields, nextSt, opts) => {
               setStudents(prev => prev.map(s => 
                 (s.rowIndex === updatedFields.rowIndex || s.student_id === updatedFields.student_id) ? { ...s, ...updatedFields } : s
               ));
+              if (opts && opts.keepOpen) return;
               if (nextSt) {
                 setSelected(nextSt);
                 setToast(`✓ Đã lưu ${updatedFields.full_name || selected.full_name} · Sang ${nextSt.full_name}`);
               } else {
                 setSelected(null);
-                setToast('✓ Đã lưu nhận xét');
+                setToast('✓ Đã lưu vào Sheet');
               }
               setTimeout(() => setToast(null), 2500);
             }}
@@ -1266,18 +1306,19 @@ const reportTargetYear  = currentYear;
             teacherLogin={teacher.login}
             onClose={() => setSelectedMonthly(null)}
             onSelectStudent={(nextSt) => setSelectedMonthly(nextSt)}
-            onSaved={(updatedFields, nextSt) => {
+            onSaved={(updatedFields, nextSt, opts) => {
               setMonthlyStudents(prev => prev.map(s => 
                 (s.rowIndex === updatedFields.rowIndex && s.fileId === updatedFields.fileId) 
                   ? { ...s, ...updatedFields } 
                   : s
               ));
+              if (opts && opts.keepOpen) return;
               if (nextSt) {
                 setSelectedMonthly(nextSt);
                 setToast(`✓ Đã lưu ${updatedFields.full_name || selectedMonthly.full_name} · Sang ${nextSt.full_name}`);
               } else {
                 setSelectedMonthly(null);
-                setToast('✓ Đã lưu báo cáo tháng');
+                setToast('✓ Đã lưu báo cáo tháng vào Sheet');
               }
               setTimeout(() => setToast(null), 2500);
             }}
@@ -1321,7 +1362,17 @@ function DetailPanel({ student, classStudents, fileId, tab, currentMonth, curren
   const [draftNotice, setDraftNotice] = useState(false);
 
   const draftKey = `fb_${tab}_${student.student_id}`;
-  const backdropHandlers = useBackdropClose(onClose);
+  // Trạng thái lưu của HS này (theo hàng chờ) + chặn thoát khi chưa lưu xong
+  useSyncQueueVersion();
+  const saveSt = syncQueue.statusFor('feedback', fileId, tab, student.student_id);
+  const [busy, setBusy] = useState(false);
+  const [confirmLeave, setConfirmLeave] = useState(false);
+  const alive = useRef(true);
+  useEffect(() => () => { alive.current = false; }, []);
+  const requestClose = () => { if (saveSt && saveSt.state !== 'saved') setConfirmLeave(true); else onClose(); };
+  // Tự đóng hộp cảnh báo khi hàng chờ đã lưu xong (vd: mạng có lại, tự thử lại thành công)
+  useEffect(() => { if (confirmLeave && (!saveSt || saveSt.state === 'saved')) setConfirmLeave(false); }, [confirmLeave, saveSt && saveSt.state]);
+  const backdropHandlers = useBackdropClose(requestClose);
 
   // Khôi phục bản nháp nếu có
   useEffect(() => {
@@ -1406,7 +1457,7 @@ ${note}`;
   const prevStudent = currentIndex > 0 ? classList[currentIndex - 1] : null;
   const nextStudent = (currentIndex >= 0 && currentIndex < totalInClass - 1) ? classList[currentIndex + 1] : null;
 
-  const doSave = (andNext = false) => {
+  const doSave = async (andNext = false) => {
     const missingFields = [];
     if (!student.is_absent) {
       if (!statusEvaluation || !statusEvaluation.trim()) missingFields.push("Đánh giá chung");
@@ -1432,8 +1483,8 @@ ${note}`;
     // 1. Xóa draft
     clearDraft(draftKey);
 
-    // 2. Đẩy vào background sync queue để đồng bộ ngầm
-    syncQueue.enqueueFeedback({
+    // 2. Đưa vào hàng chờ lưu (giữ trên máy tới khi server xác nhận đã ghi)
+    const taskId = syncQueue.enqueueFeedback({
       fileId: fileId,
       tab: tab,
       rowIndex: student.rowIndex,
@@ -1443,10 +1494,11 @@ ${note}`;
       scoreB1: scoreB1,
       scoreB2: scoreB2,
       statusEvaluation: statusEvaluation,
-      studentId: student.student_id
+      studentId: student.student_id,
+      studentName: student.full_name,
+      classCode: student.class_code
     });
 
-    // 3. Optimistic Update ngay lập tức (0s wait)
     const updatedData = {
       rowIndex: student.rowIndex,
       student_id: student.student_id,
@@ -1457,12 +1509,17 @@ ${note}`;
       status: statusEvaluation,
       updated_at: nowFormatted
     };
+    // Cập nhật thẻ ngay nhưng GIỮ khung mở cho tới khi Sheet xác nhận
+    onSaved(updatedData, undefined, { keepOpen: true });
 
-    if (andNext && nextStudent) {
-      onSaved(updatedData, nextStudent);
-    } else {
-      onSaved(updatedData, null);
-    }
+    // 3. Chờ server ghi xong + đọc lại đúng
+    setBusy(true);
+    const r = await syncQueue.waitFor(taskId);
+    if (!alive.current) return;
+    setBusy(false);
+    if (!r.ok) return; // giữ khung, thanh trạng thái hiện lỗi + nút Thử lại
+    const savedAt = (r.result && r.result.updated_at) || nowFormatted;
+    onSaved({ ...updatedData, updated_at: savedAt }, andNext && nextStudent ? nextStudent : null);
   };
 
   const copyParent = async () => {
@@ -1504,7 +1561,7 @@ ${note}`;
                     <button onClick={() => nextStudent && onSelectStudent(nextStudent)} disabled={!nextStudent} title="Học sinh tiếp theo" className="px-1 font-bold hover:text-[var(--ink)] disabled:opacity-20 cursor-pointer">▶</button>
                   </div>
                 )}
-                <button onClick={onClose} className="w-9 h-9 rounded-md ghost-btn grid place-items-center text-xl font-light">×</button>
+                <button onClick={requestClose} className="w-9 h-9 rounded-md ghost-btn grid place-items-center text-xl font-light">×</button>
               </div>
             </div>
           </div>
@@ -1647,16 +1704,20 @@ ${note}`;
         </div>
 
         {/* Footer Action Buttons */}
+        {confirmLeave && <UnsavedConfirm onWait={() => setConfirmLeave(false)} onLeave={() => { setConfirmLeave(false); onClose(); }} />}
+        {view === 'write' && saveSt && (
+          <div className="sticky bottom-[73px] px-6 pb-2 bg-[var(--paper)]"><SaveStatusBar st={saveSt} onRetry={() => syncQueue.retry(saveSt.id)} /></div>
+        )}
         {view === 'write' && (
           <div className="sticky bottom-0 bg-[var(--paper)] border-t border-[var(--line)] px-6 py-4 flex gap-2 items-center">
             <button onClick={copyParent} disabled={!note.trim()} className="ghost-btn px-4 py-2.5 rounded-md text-sm font-medium disabled:opacity-40" title="Copy mẫu gửi PH">
               {copied ? '✓ Đã copy' : 'Copy mẫu'}
             </button>
-            <button onClick={() => doSave(false)} className="ghost-btn px-4 py-2.5 rounded-md text-sm font-medium hover:bg-[var(--accent)] hover:text-white transition-colors" style={{borderColor:'var(--accent)',color:'var(--accent-dark)'}} title="Lưu học sinh này và đóng cửa sổ">
+            <button onClick={() => doSave(false)} disabled={busy} className="ghost-btn px-4 py-2.5 rounded-md text-sm font-medium hover:bg-[var(--accent)] hover:text-white transition-colors disabled:opacity-50" style={{borderColor:'var(--accent)',color:'var(--accent-dark)'}} title="Lưu học sinh này và đóng cửa sổ">
               💾 Lưu
             </button>
-            <button onClick={() => doSave(true)} className="ink-btn px-5 py-2.5 rounded-md text-sm font-semibold flex-1 flex items-center justify-center gap-1.5 shadow-md hover:shadow-lg transition-all" title="Lưu học sinh này và mở ngay học sinh tiếp theo trong lớp">
-              <span>{nextStudent ? '💾 Lưu & Tiếp theo ➔' : '💾 Lưu & Hoàn thành ✓'}</span>
+            <button onClick={() => doSave(true)} disabled={busy} className="ink-btn px-5 py-2.5 rounded-md text-sm font-semibold flex-1 flex items-center justify-center gap-1.5 shadow-md hover:shadow-lg transition-all disabled:opacity-60" title="Lưu học sinh này và mở ngay học sinh tiếp theo trong lớp">
+              <span>{busy ? '⏳ Đang lưu vào Sheet…' : (nextStudent ? '💾 Lưu & Tiếp theo ➔' : '💾 Lưu & Hoàn thành ✓')}</span>
             </button>
           </div>
         )}
@@ -1693,7 +1754,16 @@ function MonthlyDetailPanel({ student, classStudents, fileId, currentMonth, curr
   const [aiResult, setAiResult] = useState(null);
 
   const draftKey = `monthly_${fileId}_${student.student_id}`;
-  const backdropHandlers = useBackdropClose(onClose);
+  useSyncQueueVersion();
+  const saveSt = syncQueue.statusFor('monthly', fileId, null, student.student_id);
+  const [busy, setBusy] = useState(false);
+  const [confirmLeave, setConfirmLeave] = useState(false);
+  const alive = useRef(true);
+  useEffect(() => () => { alive.current = false; }, []);
+  const requestClose = () => { if (saveSt && saveSt.state !== 'saved') setConfirmLeave(true); else onClose(); };
+  // Tự đóng hộp cảnh báo khi hàng chờ đã lưu xong (vd: mạng có lại, tự thử lại thành công)
+  useEffect(() => { if (confirmLeave && (!saveSt || saveSt.state === 'saved')) setConfirmLeave(false); }, [confirmLeave, saveSt && saveSt.state]);
+  const backdropHandlers = useBackdropClose(requestClose);
 
   // Khôi phục bản nháp nếu có
   useEffect(() => {
@@ -1729,7 +1799,7 @@ function MonthlyDetailPanel({ student, classStudents, fileId, currentMonth, curr
   const prevStudent = currentIndex > 0 ? classList[currentIndex - 1] : null;
   const nextStudent = (currentIndex >= 0 && currentIndex < totalInClass - 1) ? classList[currentIndex + 1] : null;
 
-  const handleSave = (andNext = false) => {
+  const handleSave = async (andNext = false) => {
     if (!fields.diem_dat_duoc || !fields.diem_dat_duoc.trim()) {
       alert("Không thể lưu! Vui lòng điền đầy đủ: Điểm con đạt được");
       return;
@@ -1741,12 +1811,15 @@ function MonthlyDetailPanel({ student, classStudents, fileId, currentMonth, curr
     const isDone = !!(fields.kt_dat || fields.kn_dat || fields.td_dat);
 
     // 1. Đẩy vào hàng đợi lưu ngầm
-    syncQueue.enqueueMonthly({
+    const taskId = syncQueue.enqueueMonthly({
       fileId: fileId,
       rowIndex: student.rowIndex,
       fields: fields,
       teacherLogin: teacherLogin,
-      studentId: student.student_id
+      studentId: student.student_id,
+      studentName: student.full_name,
+      classCode: student.class_code,
+      monthLabel: student.monthLabel
     });
 
     // 2. Optimistic Update ngay lập tức (0s wait)
@@ -1767,12 +1840,14 @@ function MonthlyDetailPanel({ student, classStudents, fileId, currentMonth, curr
       updated_at: nowFormatted,
       is_done: isDone
     };
+    onSaved(updatedData, undefined, { keepOpen: true });
 
-    if (andNext && nextStudent) {
-      onSaved(updatedData, nextStudent);
-    } else {
-      onSaved(updatedData, null);
-    }
+    setBusy(true);
+    const r = await syncQueue.waitFor(taskId);
+    if (!alive.current) return;
+    setBusy(false);
+    if (!r.ok) return;
+    onSaved({ ...updatedData, updated_at: (r.result && r.result.updated_at) || nowFormatted }, andNext && nextStudent ? nextStudent : null);
   };
 
   const handleExportWord = async () => {
@@ -1852,7 +1927,7 @@ function MonthlyDetailPanel({ student, classStudents, fileId, currentMonth, curr
                     <button onClick={() => nextStudent && onSelectStudent(nextStudent)} disabled={!nextStudent} title="Học sinh tiếp theo" className="px-1 font-bold hover:text-[var(--ink)] disabled:opacity-20 cursor-pointer">▶</button>
                   </div>
                 )}
-                <button onClick={onClose} className="w-9 h-9 rounded-md ghost-btn grid place-items-center text-xl font-light">×</button>
+                <button onClick={requestClose} className="w-9 h-9 rounded-md ghost-btn grid place-items-center text-xl font-light">×</button>
               </div>
             </div>
           </div>
@@ -1921,16 +1996,18 @@ function MonthlyDetailPanel({ student, classStudents, fileId, currentMonth, curr
           </div>
         </div>
 
+        {confirmLeave && <UnsavedConfirm onWait={() => setConfirmLeave(false)} onLeave={() => { setConfirmLeave(false); onClose(); }} />}
+        {saveSt && <div className="sticky bottom-[73px] px-6 pb-2 bg-[var(--paper)]"><SaveStatusBar st={saveSt} onRetry={() => syncQueue.retry(saveSt.id)} /></div>}
         <div className="sticky bottom-0 bg-[var(--paper)] border-t border-[var(--line)] px-6 py-4 flex gap-2 items-center">
-          <button onClick={handleExportWord} disabled={exporting}
+          <button onClick={handleExportWord} disabled={exporting || busy}
             className="ghost-btn px-4 py-2.5 rounded-md text-sm font-medium disabled:opacity-40">
             {exporting ? 'Đang xuất Word...' : '📄 Xuất file Word'}
           </button>
-          <button onClick={() => handleSave(false)} className="ghost-btn px-4 py-2.5 rounded-md text-sm font-medium hover:bg-[var(--accent)] hover:text-white transition-colors" style={{borderColor:'var(--accent)',color:'var(--accent-dark)'}} title="Lưu học sinh này và đóng cửa sổ">
+          <button onClick={() => handleSave(false)} disabled={busy} className="ghost-btn px-4 py-2.5 rounded-md text-sm font-medium hover:bg-[var(--accent)] hover:text-white transition-colors disabled:opacity-50" style={{borderColor:'var(--accent)',color:'var(--accent-dark)'}} title="Lưu học sinh này và đóng cửa sổ">
             💾 Lưu
           </button>
-          <button onClick={() => handleSave(true)} className="ink-btn px-5 py-2.5 rounded-md text-sm font-semibold flex-1 flex items-center justify-center gap-1.5 shadow-md hover:shadow-lg transition-all" title="Lưu học sinh này và mở ngay học sinh tiếp theo trong lớp">
-            <span>{nextStudent ? '💾 Lưu & Tiếp theo ➔' : '💾 Lưu & Hoàn thành ✓'}</span>
+          <button onClick={() => handleSave(true)} disabled={busy} className="ink-btn px-5 py-2.5 rounded-md text-sm font-semibold flex-1 flex items-center justify-center gap-1.5 shadow-md hover:shadow-lg transition-all disabled:opacity-60" title="Lưu học sinh này và mở ngay học sinh tiếp theo trong lớp">
+            <span>{busy ? '⏳ Đang lưu vào Sheet…' : (nextStudent ? '💾 Lưu & Tiếp theo ➔' : '💾 Lưu & Hoàn thành ✓')}</span>
           </button>
         </div>
       </div>

@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex">
+<title>Log lưu nhận xét · Sổ Nhận Xét</title>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root { --ink:#133849; --paper:#fdfbf4; --paper-2:#f4ede0; --accent:#4fb1b8; --good:#2f7d66; --warn:#b54708; --bad:#9a1f1f; --line:#d9d2bf; --muted:#6b6457; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:'Geist',system-ui,sans-serif; background:var(--paper); color:var(--ink); }
+  .wrap { max-width:1280px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-family:'Fraunces',serif; font-size:28px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:14px; margin:0 0 20px; }
+  .card { background:#fbfdf8; border:1px solid var(--line); border-radius:10px; padding:16px; box-shadow:0 4px 24px rgba(30,60,40,.06); }
+  .filters { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:10px; align-items:end; }
+  label { display:block; font-family:'Geist Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin-bottom:4px; }
+  input, select { width:100%; border:1px solid var(--line); border-radius:6px; padding:8px 10px; font:inherit; font-size:14px; background:#fff; color:var(--ink); }
+  button { font:inherit; cursor:pointer; border-radius:6px; padding:9px 14px; font-size:14px; font-weight:600; }
+  .btn { background:var(--ink); color:#fff; border:1px solid var(--ink); }
+  .ghost { background:#fff; color:var(--ink); border:1px solid var(--line); }
+  .summary { display:flex; gap:10px; flex-wrap:wrap; margin:16px 0 10px; }
+  .pill { font-size:13px; padding:4px 10px; border-radius:999px; border:1px solid var(--line); background:#fff; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; font-family:'Geist Mono',monospace; font-size:11px; text-transform:uppercase; color:var(--muted); padding:8px; border-bottom:1px solid var(--line); position:sticky; top:0; background:#fbfdf8; }
+  td { padding:8px; border-bottom:1px solid #ece6d6; vertical-align:top; }
+  tr.row:hover td { background:#f7f3ea; cursor:pointer; }
+  .mono { font-family:'Geist Mono',monospace; font-size:12px; }
+  .st { display:inline-block; font-weight:600; font-size:12px; padding:2px 8px; border-radius:999px; white-space:nowrap; }
+  .ok { color:var(--good); background:#e7f5ef; border:1px solid #b9e0cf; }
+  .bad { color:var(--bad); background:#fdecec; border:1px solid #f2c1c1; }
+  .wait { color:var(--warn); background:#fff4e5; border:1px solid #f5d3a6; }
+  .detail td { background:#f7f3ea; }
+  .detail pre { white-space:pre-wrap; margin:0; font-family:inherit; font-size:13px; line-height:1.5; }
+  .ev { font-size:12px; color:var(--muted); margin-top:8px; }
+  .muted { color:var(--muted); }
+  .scroll { overflow-x:auto; }
+  #login { max-width:380px; margin:12vh auto; }
+  .err { color:var(--bad); font-size:13px; margin-top:8px; min-height:18px; }
+</style>
+</head>
+<body>
+<div id="login" class="card" hidden>
+  <h1>Log lưu nhận xét</h1>
+  <p class="sub">Trang dành cho Admin.</p>
+  <label for="pw">Mật khẩu</label>
+  <input id="pw" type="password" autocomplete="current-password">
+  <div style="margin-top:12px"><button class="btn" id="loginBtn">Đăng nhập</button></div>
+  <div class="err" id="loginErr"></div>
+</div>
+
+<div class="wrap" id="app" hidden>
+  <h1>Log lưu nhận xét</h1>
+  <p class="sub">Mỗi dòng là một lần GV bấm lưu. <b>Đã ghi Sheet</b> do server Apps Script xác nhận, GV không làm giả được. Bấm vào dòng để xem toàn văn nội dung.</p>
+
+  <div class="card">
+    <div class="filters">
+      <div><label>Tài khoản GV</label><input id="fLogin" placeholder="vd: hangnt.math"></div>
+      <div><label>Học sinh (ID / tên)</label><input id="fStudent"></div>
+      <div><label>Mã lớp</label><input id="fCls"></div>
+      <div><label>Loại</label><select id="fKind"><option value="">Tất cả</option><option value="week">Nhận xét tuần</option><option value="month">Báo cáo tháng</option></select></div>
+      <div><label>Từ ngày</label><input id="fFrom" type="date"></div>
+      <div><label>Đến ngày</label><input id="fTo" type="date"></div>
+      <div style="display:flex;gap:8px"><button class="btn" id="searchBtn">Tìm</button><button class="ghost" id="csvBtn">Tải CSV</button></div>
+    </div>
+  </div>
+
+  <div class="summary" id="summary"></div>
+  <div class="card scroll"><table>
+    <thead><tr><th>Bấm lưu lúc</th><th>GV</th><th>Loại</th><th>Tuần / Tháng</th><th>Học sinh</th><th>Lớp</th><th>Trạng thái</th></tr></thead>
+    <tbody id="rows"><tr><td colspan="7" class="muted">Chọn điều kiện rồi bấm Tìm.</td></tr></tbody>
+  </table></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let PW = '';
+try { PW = sessionStorage.getItem('snx_admin_pw') || ''; } catch (e) {}
+let ITEMS = [];
+
+const fmt = t => t ? new Date(t).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh', hour12: false }) : '';
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function statusOf(it) {
+  if (it.writtenAt) return { cls: 'ok', text: '✓ Đã ghi Sheet' + (it.row ? ' (dòng ' + it.row + ')' : '') };
+  if (it.result === 'failed') return { cls: 'bad', text: '✗ Server từ chối' };
+  if (it.result === 'error') return { cls: 'bad', text: '✗ Lỗi mạng/quá thời gian' };
+  if (it.result === 'ok') return { cls: 'ok', text: '✓ Đã lưu (chưa có xác nhận server)' };
+  return { cls: 'wait', text: '… Chưa có kết quả' };
+}
+const KIND = { week: 'Nhận xét tuần', month: 'Báo cáo tháng' };
+const LABEL = { danh_gia: 'Đánh giá', diem_b1: 'Điểm BTVN B1', diem_b2: 'Điểm BTVN B2', nhan_xet: 'Nhận xét',
+  diem_dat_duoc: 'Điểm con đạt được', kt_dat: 'Kiến thức đạt được', kt_caithien: 'Kiến thức cần cải thiện',
+  kn_dat: 'Kỹ năng đạt được', kn_caithien: 'Kỹ năng cần cải thiện', td_dat: 'Thái độ đạt được', td_caithien: 'Thái độ cần cải thiện',
+  khac_phuc: 'Nhược điểm đã khắc phục', giai_phap: 'Giải pháp định hướng' };
+function contentText(c) {
+  if (!c) return '';
+  if (typeof c === 'string') { try { c = JSON.parse(c); } catch (e) { return c; } }
+  return Object.keys(c).filter(k => c[k]).map(k => (LABEL[k] || k) + ': ' + c[k]).join('\n');
+}
+
+async function api(params) {
+  const res = await fetch('/api/admin-logs?' + new URLSearchParams(params), { headers: { 'x-admin-password': PW } });
+  if (res.status === 401) throw new Error('auth');
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data.items || [];
+}
+
+function render() {
+  const n = ITEMS.length, ok = ITEMS.filter(i => i.writtenAt).length, bad = ITEMS.filter(i => !i.writtenAt && (i.result === 'failed' || i.result === 'error')).length;
+  $('summary').innerHTML = `<span class="pill">${n} lần lưu</span><span class="pill" style="color:var(--good)">${ok} đã ghi Sheet</span><span class="pill" style="color:var(--bad)">${bad} lỗi</span><span class="pill" style="color:var(--warn)">${n - ok - bad} chưa có kết quả</span>`;
+  if (!n) { $('rows').innerHTML = '<tr><td colspan="7" class="muted">Không có lần lưu nào khớp điều kiện.</td></tr>'; return; }
+  $('rows').innerHTML = ITEMS.map((it, i) => {
+    const st = statusOf(it);
+    const first = it.attemptAt || (it.events[0] && it.events[0].at);
+    return `<tr class="row" data-i="${i}"><td class="mono">${esc(fmt(first))}</td><td>${esc(it.login)}</td><td>${esc(KIND[it.kind] || it.kind || '')}</td><td class="mono">${esc(it.period)}</td><td>${esc(it.student_name)} <span class="mono muted">${esc(it.student_id)}</span></td><td class="mono">${esc(it.class_code)}</td><td><span class="st ${st.cls}">${esc(st.text)}</span>${it.error && !it.writtenAt ? '<div class="muted" style="font-size:12px;margin-top:4px">' + esc(it.error) + '</div>' : ''}</td></tr>`;
+  }).join('');
+}
+
+$('rows').addEventListener('click', e => {
+  const tr = e.target.closest('tr.row'); if (!tr) return;
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains('detail')) { next.remove(); return; }
+  const it = ITEMS[+tr.dataset.i];
+  const evs = it.events.map(ev => `${fmt(ev.at)} · ${ev.source === 'server' ? 'SERVER' : 'app'} · ${ev.event}${ev.status ? ' · ' + ev.status : ''}${ev.row_index ? ' · dòng ' + ev.row_index : ''}${ev.error ? ' · ' + ev.error : ''}${ev.ip ? ' · IP ' + ev.ip : ''}`).join('<br>');
+  const d = document.createElement('tr'); d.className = 'detail';
+  d.innerHTML = `<td colspan="7"><pre>${esc(contentText(it.content)) || '<span class="muted">(không có nội dung)</span>'}</pre><div class="ev">${evs}<br>Mã lần lưu: ${esc(it.reqId)}</div></td>`;
+  tr.after(d);
+});
+
+function params() {
+  return Object.fromEntries(Object.entries({ login: $('fLogin').value, student: $('fStudent').value, cls: $('fCls').value,
+    kind: $('fKind').value, from: $('fFrom').value, to: $('fTo').value, limit: 2000 }).filter(([, v]) => v !== ''));
+}
+async function search() {
+  $('rows').innerHTML = '<tr><td colspan="7" class="muted">Đang tải…</td></tr>';
+  try { ITEMS = await api(params()); render(); }
+  catch (e) { if (e.message === 'auth') return logout(); $('rows').innerHTML = '<tr><td colspan="7" style="color:var(--bad)">Lỗi: ' + esc(e.message) + '</td></tr>'; }
+}
+function csv() {
+  const head = ['Bấm lưu lúc', 'GV', 'Loại', 'Tuần/Tháng', 'ID HS', 'Học sinh', 'Lớp', 'Trạng thái', 'Ghi Sheet lúc', 'Dòng', 'Lỗi', 'Nội dung', 'Mã lần lưu'];
+  const q = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  const lines = [head.map(q).join(',')].concat(ITEMS.map(it => [fmt(it.attemptAt), it.login, KIND[it.kind] || it.kind, it.period, it.student_id, it.student_name, it.class_code,
+    statusOf(it).text, fmt(it.writtenAt), it.row || '', it.error || '', contentText(it.content), it.reqId].map(q).join(',')));
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' }));
+  a.download = 'log-luu-nhan-xet.csv'; a.click();
+}
+function logout() { PW = ''; try { sessionStorage.removeItem('snx_admin_pw'); } catch (e) {} $('app').hidden = true; $('login').hidden = false; $('loginErr').textContent = 'Sai mật khẩu.'; }
+async function login() {
+  PW = $('pw').value; $('loginErr').textContent = '';
+  try { await api({ limit: 1 }); try { sessionStorage.setItem('snx_admin_pw', PW); } catch (e) {} show(); }
+  catch (e) { $('loginErr').textContent = e.message === 'auth' ? 'Sai mật khẩu.' : 'Lỗi: ' + e.message; }
+}
+function show() {
+  $('login').hidden = true; $('app').hidden = false;
+  const d = new Date(Date.now() + 7 * 3600e3).toISOString().slice(0, 10);
+  if (!$('fTo').value) $('fTo').value = d;
+  if (!$('fFrom').value) $('fFrom').value = new Date(Date.now() + 7 * 3600e3 - 6 * 864e5).toISOString().slice(0, 10);
+  search();
+}
+$('loginBtn').onclick = login; $('pw').onkeydown = e => { if (e.key === 'Enter') login(); };
+$('searchBtn').onclick = search; $('csvBtn').onclick = csv;
+document.querySelectorAll('.filters input').forEach(i => i.addEventListener('keydown', e => { if (e.key === 'Enter') search(); }));
+if (PW) show(); else $('login').hidden = false;
+</script>
+</body>
+</html>
