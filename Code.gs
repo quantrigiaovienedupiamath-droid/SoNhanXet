@@ -170,12 +170,28 @@ function serverAuditLog_(evt) {
     const secret = props.getProperty('LOG_SECRET');
     if (!secret) return;
     const url = props.getProperty('LOG_URL') || AUDIT_LOG_URL_DEFAULT;
-    UrlFetchApp.fetch(url, {
+    const res = UrlFetchApp.fetch(url, {
       method: 'post', contentType: 'application/json', muteHttpExceptions: true,
       headers: { 'x-log-secret': secret },
       payload: JSON.stringify({ events: [Object.assign({ serverTime: new Date().toISOString() }, evt)] }),
     });
-  } catch (e) { Logger.log('serverAuditLog_ lỗi: ' + e); }
+    const code = res.getResponseCode();
+    if (code < 200 || code >= 300) Logger.log('serverAuditLog_ HTTP ' + code + ': ' + res.getContentText().slice(0, 200));
+    return code;
+  } catch (e) { Logger.log('serverAuditLog_ lỗi: ' + e); return -1; }
+}
+
+// Chạy tay trong trình soạn Apps Script để kiểm tra kết nối log Vercel (không đổi dữ liệu Sheet)
+function testAuditLog() {
+  const props = PropertiesService.getScriptProperties();
+  const secret = props.getProperty('LOG_SECRET');
+  if (!secret) { Logger.log('❌ Chưa có Script Property tên LOG_SECRET (Project Settings → Script Properties). Lưu ý viết đúng chữ hoa.'); return; }
+  Logger.log('LOG_SECRET dài ' + secret.length + ' ký tự' + (secret !== secret.trim() ? ' — ⚠️ CÓ DẤU CÁCH/XUỐNG DÒNG ở đầu/cuối, hãy xoá đi' : ''));
+  Logger.log('Gửi tới: ' + (props.getProperty('LOG_URL') || AUDIT_LOG_URL_DEFAULT));
+  const code = serverAuditLog_({ event: 'written', status: 'test', reqId: 'test_' + Date.now(), login: 'test-apps-script', kind: 'week', period: 'TEST' });
+  if (code >= 200 && code < 300) Logger.log('✅ Kết nối OK (HTTP ' + code + '). Trên trang admin, tìm GV "test-apps-script" sẽ thấy 1 dòng.');
+  else if (code === 401) Logger.log('❌ HTTP 401: LOG_SECRET ở Apps Script KHÁC với LOG_SECRET trên Vercel. Dán lại cho giống hệt, rồi Redeploy Vercel.');
+  else Logger.log('❌ Lỗi (mã ' + code + '). Xem dòng log phía trên để biết chi tiết.');
 }
 
 // So sánh giá trị đã ghi với giá trị đọc lại — bỏ qua khác biệt định dạng vô hại

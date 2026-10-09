@@ -218,14 +218,15 @@ async function flushAuditLog() {
   const box = readJSON(LOG_OUTBOX_KEY, []);
   if (!box.length) return;
   auditFlushing = true;
+  let okSent = false;
   try {
-    const batch = box.slice(0, 100);
+    const batch = box.slice(0, 20);  // lô nhỏ để không quá thời gian/giới hạn dung lượng
     const body = JSON.stringify({ events: batch });
     const res = await fetch(LOG_BASE + '/api/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, keepalive: body.length < 60000 });
-    if (res.ok) writeJSON(LOG_OUTBOX_KEY, readJSON(LOG_OUTBOX_KEY, []).slice(batch.length));
+    if (res.ok) { writeJSON(LOG_OUTBOX_KEY, readJSON(LOG_OUTBOX_KEY, []).slice(batch.length)); okSent = true; }
   } catch (e) {}
   auditFlushing = false;
-  if (readJSON(LOG_OUTBOX_KEY, []).length && navigator.onLine) setTimeout(flushAuditLog, 15000);
+  if (readJSON(LOG_OUTBOX_KEY, []).length && navigator.onLine) setTimeout(flushAuditLog, okSent ? 300 : 15000);
 }
 window.addEventListener('online', flushAuditLog);
 setInterval(flushAuditLog, 60000);
