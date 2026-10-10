@@ -1969,94 +1969,142 @@ function getDeadlinesForTeacher(login, weekRange, year) {
 }
 
 // ============================================================
-// CRON: gửi mail nhắc khi còn 12h tới deadline
+// CRON (chạy mỗi giờ): nhắc GV bổ sung nhận xét — 1 mail/GV lúc 9h sáng ngày deadline
+// - Deadline nhận xét tuần = 12:00 trưa ngày T+1 (T = ngày học buổi 2)
+// - Từ 9h sáng ngày deadline, lần chạy đầu tiên sẽ gom TẤT CẢ lớp chưa NX đủ của GV vào 1 mail
+// - Quét tab tuần hiện tại + tuần trước, ở file tháng này + tháng trước
+//   (để không sót lớp học buổi 2 Chủ nhật — deadline rơi vào thứ 2 tuần mới — và tuần nằm giữa 2 tháng)
+// - Mỗi GV chỉ nhận 1 mail cho mỗi ngày deadline; lỗi gửi 1 mail không làm dừng các mail khác
 // ============================================================
+const REMIND_HOUR = 9;
+// Không gửi mail vi phạm / cảnh báo quá hạn cho từng GV lúc 12h (tiết kiệm lượt gửi mail). Vẫn ghi vào sheet vi phạm + 1 mail tổng hợp cho Admin.
+const SEND_VIOLATION_EMAIL_TO_GV = false;
+
+function weekTabRange_(name, fileMonth, fileYear) {
+  const m = name.replace(/\s+/g, '').match(/^(\d+)\/(\d+)-(\d+)\/(\d+)$/);
+  if (!m) return null;
+  const sm = parseInt(m[2]), em = parseInt(m[4]);
+  // Năm của tab: tab tháng 12 nằm trong file tháng 1 năm sau (hoặc ngược lại)
+  const sy = (sm === 12 && fileMonth === 1) ? fileYear - 1 : fileYear;
+  const ey = (em === 1 && sm === 12) ? sy + 1 : sy;
+  const start = new Date(sy, sm - 1, parseInt(m[1]));
+  const end = new Date(ey, em - 1, parseInt(m[3]), 23, 59, 59);
+  return { start: start, end: end, year: sy };
+}
+
 function cronCheckRemind12h() {
   const now = new Date();
-  const month = now.getMonth() + 1;
-  const year = now.getFullYear();
-  const file = findMonthlyFile(month, year);
-  if (!file) return;
+  const hourVN = parseInt(Utilities.formatDate(now, TIMEZONE, 'H'), 10);
+  if (hourVN < REMIND_HOUR || hourVN >= DEADLINE_HOUR) return;   // chỉ chạy 9:00–11:59
+  const todayVN = Utilities.formatDate(now, TIMEZONE, 'yyyy-MM-dd');
 
-  const ss = SpreadsheetApp.openById(file.id);
+  const cur = { month: now.getMonth() + 1, year: now.getFullYear() };
+  const prv = getPrevMonth(cur.month, cur.year);
   const schedules = loadClassSchedules();
+  const lookBack = new Date(now.getTime() - 9 * 24 * 3600 * 1000);
 
+  // 1. Gom lớp chưa NX đủ có deadline HÔM NAY, từ mọi tab liên quan
+  const byTeacher = {};   // login → { classes: {classCode: {done,total,tab,deadline}} }
+  [cur, prv].forEach(fm => {
+    const file = findMonthlyFile(fm.month, fm.year);
+    if (!file) return;
+    const ss = SpreadsheetApp.openById(file.id);
+    ss.getSheets().forEach(sheet => {
+      const tabName = sheet.getName();
+      if (tabName.startsWith('_')) return;
+      const rg = weekTabRange_(tabName, fm.month, fm.year);
+      if (!rg || rg.end < lookBack || rg.start > now) return;
+      const data = sheet.getDataRange().getValues();
+      const classMap = {};
+      for (let i = 1; i < data.length; i++) {
+        const r = data[i];
+        if (!r[1]) continue;
+        if ((r[12] || '').toString() === 'Nghỉ') continue;
+        const classCode = (r[4] || '').toString().trim();
+        const teacher = (r[5] || '').toString().trim().toLowerCase();
+        if (!classCode || !teacher) continue;
+        const key = teacher + '|' + classCode;
+        if (!classMap[key]) classMap[key] = { teacher: teacher, classCode: classCode, total: 0, done: 0 };
+        classMap[key].total++;
+        if ((r[10] || '').toString().trim()) classMap[key].done++;
+      }
+      for (const key in classMap) {
+        const cm = classMap[key];
+        if (cm.done >= cm.total) continue;
+        const sched = schedules[cm.classCode] || schedules[normalizeClassCode(cm.classCode)];
+        if (!sched) continue;
+        const deadline = calcDeadline(tabName, sched, rg.year);
+        if (!deadline || now >= deadline) continue;
+        if (Utilities.formatDate(deadline, TIMEZONE, 'yyyy-MM-dd') !== todayVN) continue;
+        const t = byTeacher[cm.teacher] || (byTeacher[cm.teacher] = { classes: {} });
+        const prev = t.classes[cm.classCode];
+        // Cùng lớp xuất hiện ở 2 file (tuần giữa 2 tháng) → cộng dồn
+        if (prev && prev.tab === tabName) { prev.done += cm.done; prev.total += cm.total; }
+        else if (!prev) t.classes[cm.classCode] = { done: cm.done, total: cm.total, tab: tabName, deadline: deadline };
+      }
+    });
+  });
+
+  const logins = Object.keys(byTeacher);
+  if (!logins.length) { Logger.log('Nhắc 9h: không có GV nào cần nhắc hôm nay.'); return; }
+
+  // 2. Email GV
   const lichSS = SpreadsheetApp.openById(CONFIG.LICH_LOP_SHEET_ID);
   const teachersData = lichSS.getSheetByName('_Teachers').getDataRange().getValues();
   const teacherEmails = {};
   for (let i = 1; i < teachersData.length; i++) {
     const r = teachersData[i];
-    if (r[0]) teacherEmails[r[0].toString().toLowerCase()] = { email: r[2], name: r[3] };
+    if (r[0]) teacherEmails[r[0].toString().trim().toLowerCase()] = { email: (r[2] || '').toString().trim(), name: r[3] };
   }
 
-  const currentTabs = ss.getSheets().filter(s => {
-    const name = s.getName();
-    if (name.startsWith('_')) return false;
-    const m = name.replace(/\s+/g, '').match(/(\d+)\/(\d+)-(\d+)\/(\d+)/);
-    if (!m) return false;
-    const startDate = new Date(year, parseInt(m[2]) - 1, parseInt(m[1]));
-    const endDate = new Date(year, parseInt(m[4]) - 1, parseInt(m[3]));
-    endDate.setHours(23, 59, 59);
-    return now >= startDate && now <= endDate;
-  });
-  if (currentTabs.length === 0) return;
-
-  const sheet = currentTabs[0];
-  const tabName = sheet.getName();
-  const data = sheet.getDataRange().getValues();
-
+  // 3. Gửi — mỗi GV 1 mail / ngày
   const sentMap = getRemindedSet();
-  const newReminders = [];
-
-  const classMap = {};
-  for (let i = 1; i < data.length; i++) {
-    const r = data[i];
-    if (!r[1]) continue;
-    if ((r[12] || '').toString() === 'Nghỉ') continue;
-    const classCode = r[4];
-    const teacherLogin = (r[5] || '').toString().toLowerCase();
-    const hasNote = (r[10] || '').toString().trim();
-    const key = teacherLogin + '|' + classCode;
-    if (!classMap[key]) classMap[key] = { teacher: teacherLogin, classCode: classCode, total: 0, done: 0 };
-    classMap[key].total++;
-    if (hasNote) classMap[key].done++;
+  const newKeys = [];
+  const stats = { sent: 0, skipped: 0, noEmail: [], failed: [], quotaLeft: MailApp.getRemainingDailyQuota() };
+  const appUrl = ScriptApp.getService().getUrl();
+  try {
+    for (const login of logins) {
+      const sentKey = 'R9|' + todayVN + '|' + login;
+      if (sentMap[sentKey]) { stats.skipped++; continue; }
+      const info = teacherEmails[login];
+      if (!info || !info.email) { stats.noEmail.push(login); continue; }
+      if (MailApp.getRemainingDailyQuota() < 1) { stats.failed.push(login + ' (hết lượt gửi mail hôm nay)'); continue; }
+      const cls = byTeacher[login].classes;
+      const codes = Object.keys(cls).sort();
+      const dl = cls[codes[0]].deadline;
+      try {
+        MailApp.sendEmail({
+          to: info.email,
+          subject: '⏰ [Sổ Nhận Xét] Nhắc bổ sung nhận xét trước 12:00 hôm nay (' + codes.length + ' lớp)',
+          htmlBody:
+            '<p>Xin chào <strong>' + (info.name || login) + '</strong>,</p>' +
+            '<p>Hệ thống nhắc bạn hoàn thành nhận xét trước <strong>' + Utilities.formatDate(dl, TIMEZONE, 'HH:mm dd/MM/yyyy') + '</strong> cho các lớp sau:</p>' +
+            '<ul>' + codes.map(c => '<li><strong>' + c + '</strong> (tuần ' + cls[c].tab + ') — đã NX ' + cls[c].done + '/' + cls[c].total + ' HS</li>').join('') + '</ul>' +
+            '<p>👉 <a href="' + appUrl + '">Mở Sổ Nhận Xét</a></p>' +
+            '<p><em>Quá 12:00 trưa mà lớp vẫn chưa có nhận xét nào sẽ bị ghi nhận vi phạm.</em></p>',
+        });
+        newKeys.push(sentKey);
+        stats.sent++;
+      } catch (e) {
+        stats.failed.push(login + ' (' + e.message + ')');
+        if (/too many times|quota|giới hạn/i.test(e.message)) break;   // hết lượt → dừng, lần chạy sau thử tiếp
+      }
+    }
+  } finally {
+    Object.keys(sentMap).forEach(k => { if (k.indexOf('R9|') !== 0) delete sentMap[k]; }); // bỏ khoá kiểu cũ
+    try { saveRemindedSet(sentMap, newKeys); } catch (e) { Logger.log('Không lưu được REMINDED_12H: ' + e); }
   }
-
-  for (const key in classMap) {
-    const cm = classMap[key];
-    if (cm.done >= cm.total) continue;
-
-    const sched = schedules[cm.classCode];
-    if (!sched) continue;
-    const deadline = calcDeadline(tabName, sched, year);
-    if (!deadline) continue;
-
-    const msToDeadline = deadline.getTime() - now.getTime();
-    const hoursLeft = msToDeadline / (1000 * 60 * 60);
-    // Nhắc khi còn 3–4h trước deadline (deadline 12:00 trưa → nhắc lúc ~8h sáng T+1)
-    if (hoursLeft < 3 || hoursLeft > 4) continue;
-
-    const sentKey = tabName + '|' + cm.classCode + '|' + cm.teacher;
-    if (sentMap[sentKey]) continue;
-
-    const teacherInfo = teacherEmails[cm.teacher];
-    if (!teacherInfo || !teacherInfo.email) continue;
-
-    MailApp.sendEmail({
-      to: teacherInfo.email,
-      subject: '⏰ [Sổ Nhận Xét] Nhắc nhở: Còn ~4h để nhận xét lớp ' + cm.classCode,
-      htmlBody:
-        '<p>Xin chào <strong>' + (teacherInfo.name || cm.teacher) + '</strong>,</p>' +
-        '<p>Nhắc nhở: Bạn còn khoảng <strong>4 giờ</strong> (deadline <strong>12:00 trưa hôm nay</strong>) để hoàn thành nhận xét cho lớp:</p>' +
-        '<ul><li><strong>' + cm.classCode + '</strong> — đã NX ' + cm.done + '/' + cm.total + ' HS</li></ul>' +
-        '<p>Deadline: <strong>' + Utilities.formatDate(deadline, TIMEZONE, 'HH:mm dd/MM/yyyy') + '</strong></p>' +
-        '<p>Vui lòng vào Sổ Nhận Xét: <a href="' + ScriptApp.getService().getUrl() + '">Mở app</a></p>',
-    });
-    newReminders.push(sentKey);
-    Logger.log('Đã gửi nhắc 8h sáng (còn ~4h): ' + cm.teacher + ' - ' + cm.classCode);
+  Logger.log('Nhắc 9h ' + todayVN + ': cần nhắc ' + logins.length + ' GV | đã gửi ' + stats.sent +
+             ' | đã gửi trước đó ' + stats.skipped + ' | thiếu email ' + stats.noEmail.length +
+             (stats.noEmail.length ? ' (' + stats.noEmail.join(', ') + ')' : '') +
+             ' | lỗi ' + stats.failed.length + (stats.failed.length ? ' (' + stats.failed.join('; ') + ')' : '') +
+             ' | lượt mail còn trước khi gửi: ' + stats.quotaLeft);
+  if (stats.failed.length) {
+    try {
+      MailApp.sendEmail(CONFIG.ADMIN_EMAIL, '⚠️ [Sổ Nhận Xét] ' + stats.failed.length + ' mail nhắc 9h chưa gửi được',
+        'Ngày ' + todayVN + '. Chưa gửi được cho: ' + stats.failed.join('; ') + '. Hệ thống sẽ thử lại ở lần chạy sau (trước 12h).');
+    } catch (e) {}
   }
-
-  saveRemindedSet(sentMap, newReminders);
 }
 
 function getRemindedSet() {
@@ -2258,9 +2306,9 @@ function cronRecordViolations() {
     if (r[0]) teacherEmailMap[r[0].toString().toLowerCase()] = { email: r[2] || '', name: r[3] || r[0] };
   }
 
-  // Gửi mail vi phạm cho GV (done === 0)
+  // Gửi mail vi phạm cho GV (done === 0) — đang TẮT (SEND_VIOLATION_EMAIL_TO_GV)
   const byTeacherViol = {};
-  violationRows.forEach(function(v) {
+  if (SEND_VIOLATION_EMAIL_TO_GV) violationRows.forEach(function(v) {
     const login = v.teacher.toLowerCase();
     if (!byTeacherViol[login]) byTeacherViol[login] = [];
     byTeacherViol[login].push(v);
@@ -2291,7 +2339,7 @@ function cronRecordViolations() {
 
   // Gửi mail cảnh báo quá hạn cho GV (0 < done < total)
   const byTeacherWarn = {};
-  warningRows.forEach(function(w) {
+  if (SEND_VIOLATION_EMAIL_TO_GV) warningRows.forEach(function(w) {
     const login = w.teacher.toLowerCase();
     if (!byTeacherWarn[login]) byTeacherWarn[login] = [];
     byTeacherWarn[login].push(w);
@@ -4155,7 +4203,7 @@ function setupTriggers() {
     Logger.log('Không tạo được trigger onOpen: ' + e);
   }
 
-  Logger.log('Đã setup 8 triggers + onOpen menu. Lịch: nhận xét tuần deadline 12:00 T+1 (nhắc 8h); báo cáo tháng deadline 23:59 ngày 7 (nhắc 12h ngày 7, ghi phạt sáng ngày 8).');
+  Logger.log('Đã setup 8 triggers + onOpen menu. Lịch: nhận xét tuần deadline 12:00 T+1 (nhắc 9h, 1 mail/GV; không mail phạt cho GV); báo cáo tháng deadline 23:59 ngày 7 (nhắc 12h ngày 7, ghi phạt sáng ngày 8).');
 }
 
 // ============================================================
