@@ -156,7 +156,7 @@ function perfMark_(label) {
   if (PERF_) PERF_.push(label + ' ' + (Date.now() - PERF_.t0) + 'ms');
 }
 
-const SCHEDULES_CACHE_KEY = 'class_schedules_v2';
+const SCHEDULES_CACHE_KEY = 'class_schedules_v3';
 const SCHEDULES_CACHE_TTL = 1800; // 30 phút (cron PIC 10h tự xoá cache để đọc lại)
 
 // ============================================================
@@ -418,8 +418,9 @@ function loadClassSchedules() {
   const compressed = {};
   for (let i = 1; i < data.length; i++) {
     const r = data[i];
-    if (!r[3]) continue;
-    const class_code = r[3];
+    // Bỏ khoảng trắng thừa (vd 'R.MA.6P.3A.003680 ' gõ dư dấu cách) — nếu không, lớp sẽ không được tổng hợp vào tab tuần
+    const class_code = (r[3] || '').toString().replace(/[\s\u00a0\u200b]+/g, ' ').trim();
+    if (!class_code) continue;
     const day1_num = getDayNum(r[11]);
     const day2_num = getDayNum(r[13]);
     
